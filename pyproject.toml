@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "univam"
+version = "0.1.0"
+description = ""
+authors = [
+    { name = "hello3x3", email = "shujiuhe@outlook.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>1.23.5,<2",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "accelerate==1.12.0",
+    "deepspeed==0.18.2",
+    "transformers",
+    "timm",
+    "av",
+    "diffusers",
+    "einops",
+    "jsonlines",
+    "dotenv",
+    "omegaconf",
+    "rich",
+    "tensorboard",
+    "ruff",
+    "imageio[ffmpeg]",
+    "matplotlib",
+    "fvcore"
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

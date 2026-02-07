@@ -1,0 +1,1 @@
+video_feature_extractor: ${oc.load:configs/qwen3_vl/vision_config_8b.yaml}
