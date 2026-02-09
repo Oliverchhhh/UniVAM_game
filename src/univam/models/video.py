@@ -8,7 +8,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     BaseModelOutputWithDeepstackFeatures,
     Qwen3VLVisionAttention,
     Qwen3VLVisionMLP,
-    Qwen3VLVisionPatchEmbed,
     Qwen3VLVisionPatchMerger,
     Qwen3VLVisionRotaryEmbedding,
 )
@@ -23,6 +22,28 @@ def convert_qwen3vl_to_vfe_ckpt(model_path, save_path):
     state_dict = model.model.visual.state_dict()
 
     torch.save(state_dict, save_path)
+
+
+class Qwen3VLVisionPatchEmbed(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
+
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        target_dtype = self.proj.weight.dtype
+        bsz = hidden_states.shape[0]
+        t = hidden_states.shape[1]
+        hidden_states = hidden_states.view(
+            bsz, -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        )
+        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        return hidden_states
 
 
 class Qwen3VLVisionBlock(nn.Module):
@@ -295,7 +316,7 @@ if __name__ == "__main__":
     config = load_args()
     model = Qwen3VLVisionModel(config.video_feature_extractor)
 
-    ckpt = torch.load("./Qwen3-VL-VideoFeatureExtractor.pt", map_location="cpu")
+    ckpt = torch.load(config.video_feature_extractor.ckpt_path, map_location="cpu")
 
     model.load_state_dict(ckpt)
 
@@ -306,7 +327,7 @@ if __name__ == "__main__":
     processor = Qwen3VLProcessor.from_pretrained(f"{model_path}/Qwen/Qwen3-VL-8B-Instruct")
     inputs = processor(
         text="",
-        videos=["input.mp4", "input.mp4"],
+        videos=["tests/examples/test_4frames_24fps_720x1080.mp4"],
         return_tensors="pt",
     )
     pixel_values_videos = inputs["pixel_values_videos"]
@@ -315,7 +336,7 @@ if __name__ == "__main__":
     print(pixel_values_videos.shape)
     print(video_grid_thw)
 
-    # pixel_values_videos = torch.stack([pixel_values_videos, pixel_values_videos])
+    pixel_values_videos = torch.stack([pixel_values_videos, pixel_values_videos])
     # video_grid_thw = torch.stack([video_grid_thw, video_grid_thw])
 
     o1 = model(pixel_values_videos, video_grid_thw)
