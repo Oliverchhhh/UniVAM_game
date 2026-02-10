@@ -1,11 +1,9 @@
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from einops import rearrange
+from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    BaseModelOutputWithDeepstackFeatures,
     Qwen3VLVisionAttention,
     Qwen3VLVisionMLP,
     Qwen3VLVisionPatchMerger,
@@ -18,9 +16,7 @@ def convert_qwen3vl_to_vfe_ckpt(model_path, save_path):
         model_path,
         device_map="cpu",
     )
-
     state_dict = model.model.visual.state_dict()
-
     torch.save(state_dict, save_path)
 
 
@@ -37,10 +33,8 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        bsz = hidden_states.shape[0]
-        t = hidden_states.shape[1]
         hidden_states = hidden_states.view(
-            bsz, -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
         )
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
@@ -240,7 +234,7 @@ class Qwen3VLVisionModel(nn.Module):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        deepstack_feature_lists = []
+        # deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -248,117 +242,104 @@ class Qwen3VLVisionModel(nn.Module):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
-                    hidden_states
-                )
-                deepstack_feature_lists.append(deepstack_feature)
+            # if layer_num in self.deepstack_visual_indexes:
+            #     deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](hidden_states)
+            #     deepstack_feature_lists.append(deepstack_feature)
 
         merged_hidden_states = self.merger(hidden_states)
 
-        # device = merged_hidden_states.device
-        # dtype = merged_hidden_states.dtype
-
-        # t = grid_thw[:, 0]
-        # h = grid_thw[:, 1]
-        # w = grid_thw[:, 2]
-
-        # merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        # tokens_per_video = (t * h * w) // merge_unit  # [B]
-
-        # B = tokens_per_video.numel()
-        # D = merged_hidden_states.size(-1)
-        # max_len = tokens_per_video.max().item()
-
-        # cu_seqlens = torch.zeros(len(tokens_per_video) + 1, device=device, dtype=torch.long)
-        # cu_seqlens[1:] = tokens_per_video.cumsum(0)
-
-        return BaseModelOutputWithDeepstackFeatures(
-            last_hidden_state=hidden_states,
-            pooler_output=merged_hidden_states,
-            deepstack_features=deepstack_feature_lists,
-        )
-
-    def split_pooled_output(pooler_output, video_grid_thw, spatial_merge_size):
-        """
-        pooler_output: [total_tokens, hidden_dim]
-        video_grid_thw: [B, 3]  (t, h, w)
-        """
-        device = pooler_output.device
-
-        t = video_grid_thw[:, 0]
-        h = video_grid_thw[:, 1]
-        w = video_grid_thw[:, 2]
-
-        merge_unit = spatial_merge_size * spatial_merge_size
-
-        tokens_per_video = (t * h * w) // merge_unit  # [B]
-
-        cu_seqlens = torch.zeros(len(tokens_per_video) + 1, device=device, dtype=torch.long)
-        cu_seqlens[1:] = tokens_per_video.cumsum(0)
-
-        outputs = []
-        for i in range(len(tokens_per_video)):
-            s, e = cu_seqlens[i], cu_seqlens[i + 1]
-            outputs.append(pooler_output[s:e])
-
-        return outputs, tokens_per_video, cu_seqlens
+        return merged_hidden_states
 
 
 class Qwen3VLVideoFeatureExtractor(nn.Module):
-    def __init__(self):
-        return
+    def __init__(self, config, frames=4, image_size=[256, 256]):
+        super().__init__()
+        self.vision_model = Qwen3VLVisionModel(config)
+        ckpt = torch.load(config.ckpt_path, map_location="cpu")
+        self.vision_model.load_state_dict(ckpt)
+
+        self.patch_size = config.patch_size
+        self.merge_size = config.spatial_merge_size
+        self.temporal_patch_size = config.temporal_patch_size
+
+        if frames % self.temporal_patch_size != 0:
+            raise ValueError(
+                f"`frames` ({frames}) must be divisible by `temporal_patch_size` ({self.temporal_patch_size})."
+            )
+
+        if image_size[0] % (self.patch_size * self.merge_size) != 0:
+            raise ValueError(
+                f"`image_size[0]` / H ({image_size[0]}) must be divisible by "
+                f"`patch_size` ({self.patch_size * self.merge_size})."
+            )
+
+        if image_size[1] % (self.patch_size * self.merge_size) != 0:
+            raise ValueError(
+                f"`image_size[1]` / W ({image_size[1]}) must be divisible by "
+                f"`patch_size` ({self.patch_size * self.merge_size})."
+            )
+
+        self.grid_t = frames // self.temporal_patch_size
+        self.grid_h = image_size[0] // self.patch_size
+        self.grid_w = image_size[1] // self.patch_size
+
+        self.patches = self.grid_t * self.grid_h * self.grid_w // self.merge_size // self.merge_size
+        self.out_hidden_size = config.out_hidden_size
+
+    def preprocess(self, videos):
+        B, T, C, H, W = videos.shape
+
+        videos = videos.view(
+            B,
+            self.grid_t,
+            self.temporal_patch_size,
+            C,
+            self.grid_h // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+            self.grid_w // self.merge_size,
+            self.merge_size,
+            self.patch_size,
+        )
+
+        videos = rearrange(
+            videos,
+            "b gt tpt c gh msh ph gw msw pw -> b (gt gh gw msh msw) (c tpt ph pw)",
+        )
+
+        video_grid_thw = torch.tensor([[self.grid_t, self.grid_h, self.grid_w]] * B, dtype=torch.int32)
+        return videos, video_grid_thw
+
+    def forward(self, videos, video_grid_thw):
+        bsz = videos.shape[0]
+        videos = videos.reshape(-1, videos.shape[-1])
+        video_grid_thw = video_grid_thw.reshape(-1, video_grid_thw.shape[-1])
+        pooler_feature = self.vision_model(videos, video_grid_thw)
+        pooler_feature = pooler_feature.view(bsz, -1, pooler_feature.shape[-1])
+        return pooler_feature
 
 
 if __name__ == "__main__":
     from univam.utils.args import load_args
+    from univam.utils.data import VideoData
 
-    config = load_args()
-    model = Qwen3VLVisionModel(config.video_feature_extractor)
-
-    ckpt = torch.load(config.video_feature_extractor.ckpt_path, map_location="cpu")
-
-    model.load_state_dict(ckpt)
-
-    model.eval()
-
-    model_path = os.environ.get("PRETRAINED_MODEL_PATH")
-
-    processor = Qwen3VLProcessor.from_pretrained(f"{model_path}/Qwen/Qwen3-VL-8B-Instruct")
-    inputs = processor(
-        text="",
-        videos=["tests/examples/test_4frames_24fps_720x1080.mp4"],
-        return_tensors="pt",
+    args = load_args()
+    model = Qwen3VLVideoFeatureExtractor(
+        args.video_feature_extractor,
+        image_size=args.data.image_size,
     )
-    pixel_values_videos = inputs["pixel_values_videos"]
-    video_grid_thw = inputs["video_grid_thw"]
+
+    data = VideoData(args.data)
+    data.video_paths = ["tests/examples/video_24fps_256x256.mp4"]
+    video = data.read_video_torchcodec(0, 0)
+    video = video.unsqueeze(0)
+    videos = torch.cat([video] * 2, dim=0)
+
+    pixel_values_videos, video_grid_thw = model.preprocess(videos)
 
     print(pixel_values_videos.shape)
-    print(video_grid_thw)
+    print(video_grid_thw.shape)
 
-    pixel_values_videos = torch.stack([pixel_values_videos, pixel_values_videos])
-    # video_grid_thw = torch.stack([video_grid_thw, video_grid_thw])
+    pooler_feature = model(pixel_values_videos, video_grid_thw)
 
-    o1 = model(pixel_values_videos, video_grid_thw)
-
-    print(o1["pooler_output"].shape)
-
-    # full = Qwen3VLForConditionalGeneration.from_pretrained(
-    #     f"{model_path}/Qwen/Qwen3-VL-8B-Instruct",
-    #     device_map="cpu",
-    # )
-    # full.eval()
-    # o2 = full.get_video_features(pixel_values_videos, video_grid_thw)
-
-    print(1)
-
-    #     {
-    #         "frames": 760,
-    #         "Resolution": [1280, 720],
-    #         "pixel_values_videos": [46592, 1536],
-    #         "last_hidden_state": [46592, 1024],
-    #         "pooler_output[0]": [11648, 2048],
-    #         "vision.deepstack_features[0]": [11648, 2048],
-    #         "vision.deepstack_features[1]": [11648, 2048],
-    #         "vision.deepstack_features[2]": [11648, 2048],
-    #     }
+    print(pooler_feature.shape)

@@ -1,1 +1,17 @@
 video_feature_extractor: ${oc.load:configs/qwen3_vl/vision_config_8b.yaml}
+
+projector:
+  type: mlp # mlp | qformer
+  num_token: 2
+  num_attn_layers: 6
+  num_attn_compress_layers: 6
+  hidden_dim: 2048
+  output_align_dim: 4096
+  cross_attention_dim: 1024
+
+data:
+  frames: 4
+  num_workers: 32
+  image_size: [704, 1280]
+  train_json_path: ./jsons/train_debug.json
+  eval_json_path: ./jsons/eval_debug.json
