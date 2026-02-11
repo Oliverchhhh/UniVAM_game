@@ -255,7 +255,7 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
     def __init__(self, config, frames=4, image_size=[256, 256]):
         super().__init__()
         self.vision_model = Qwen3VLVisionModel(config)
-        ckpt = torch.load(config.ckpt_path, map_location="cpu")
+        ckpt = torch.load(config.model_path, map_location="cpu")
         self.vision_model.load_state_dict(ckpt, strict=False)
 
         self.patch_size = config.patch_size
@@ -310,8 +310,14 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
         video_grid_thw = torch.tensor([[self.grid_t, self.grid_h, self.grid_w]] * B, dtype=torch.int32)
         return videos, video_grid_thw
 
-    def forward(self, videos, video_grid_thw):
+    def forward(self, videos: torch.Tensor, video_grid_thw: torch.Tensor):
         bsz = videos.shape[0]
+        device = next(self.vision_model.parameters()).device
+        dtype = next(self.vision_model.parameters()).dtype
+
+        videos = videos.to(device=device, dtype=dtype)
+        video_grid_thw = video_grid_thw.to(device=device, dtype=torch.int32)
+
         videos = videos.reshape(-1, videos.shape[-1])
         video_grid_thw = video_grid_thw.reshape(-1, video_grid_thw.shape[-1])
         pooler_feature = self.vision_model(videos, video_grid_thw)
@@ -327,18 +333,26 @@ if __name__ == "__main__":
 
     args = load_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # To infer on a GPU, you can set `_attn_implementation` with "flash_attention_2", which only support fp16 and bf16 data type
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        args._attn_implementation = "flash_attention_2"
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float32
+        args._attn_implementation = "sdpa"
 
     model = Qwen3VLVideoFeatureExtractor(
         args.video_feature_extractor,
         frames=args.data.frames,
         image_size=args.data.image_size,
-    ).to(device)
+    ).to(device=device, dtype=dtype)
 
     # get real data via Dataset
     data = VideoData(args.data)
     data.video_paths = ["tests/examples/video_24fps_256x256.mp4"]
-    video = data.read_video_torchcodec(0, 0).to(device)
+    video = data.read_video_torchcodec(0, 0)
     video = video.unsqueeze(0)
     videos = torch.cat([video] * 2, dim=0)
 

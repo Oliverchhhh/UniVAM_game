@@ -16,6 +16,9 @@ projector:
   output_align_dim: 4096
   cross_attention_dim: 2048
 
+wanva:
+  model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
+
 data:
   frames: 4
   num_workers: 32
