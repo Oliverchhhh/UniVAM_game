@@ -20,6 +20,7 @@ wanva:
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
+  fps: 24
   frames: 4
   num_workers: 32
   image_size: [256, 256]

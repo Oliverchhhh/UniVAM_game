@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+from functools import lru_cache
 
 import jsonlines
 import numpy as np
@@ -189,11 +190,73 @@ def check_tensor(obj, name, check_bound=1e4, check_std=1e3, _visited=None, force
     return problem_found
 
 
+class ResampledVideoDecoder:
+    """
+    A wrapper over VideoDecoder that provides temporal resampling
+    to a target fps using strict linear time mapping.
+    """
+
+    def __init__(self, decoder: VideoDecoder, target_fps: float):
+        self.decoder = decoder
+        self.target_fps = target_fps
+
+        meta = decoder.metadata
+        self.orig_fps = float(meta.average_fps_from_header)
+        self.orig_total_frames = int(meta.num_frames)
+
+        if (target_fps - self.orig_fps) > 0.1:
+            raise ValueError(f"Target fps: {target_fps} should not be larger than original fps: {self.orig_fps}")
+
+        self.duration = self.orig_total_frames / self.orig_fps
+
+        self.new_total_frames = max(1, int(round(self.duration * self.target_fps)))
+
+        self._metadata = self._build_metadata()
+
+    def _build_metadata(self):
+        class Meta:
+            pass
+
+        m = Meta()
+        m.fps = self.target_fps
+        m.num_frames = self.new_total_frames
+        return m
+
+    @property
+    def metadata(self):
+        return self._metadata
+
+    def _map_indices(self, target_indices):
+        """
+        将 target-fps 时间轴上的 indices
+        映射到原视频时间轴
+        """
+        if self.new_total_frames == 1:
+            return [0] * len(target_indices)
+
+        mapped = []
+
+        for idx in target_indices:
+            orig_idx = round(idx / (self.new_total_frames - 1) * (self.orig_total_frames - 1))
+            orig_idx = min(self.orig_total_frames - 1, max(0, orig_idx))
+            mapped.append(orig_idx)
+
+        return mapped
+
+    def get_frames_at(self, indices):
+        """
+        indices 是 target-fps 时间轴上的索引
+        """
+        mapped_indices = self._map_indices(indices)
+        return self.decoder.get_frames_at(mapped_indices)
+
+
 class VideoData(Dataset):
     def __init__(self, config, flip_p: float = 0.5, device="cpu"):
         self.flip_p = flip_p
         self.device = device
 
+        self.fps = config.fps
         self.frames = config.frames
         self.image_size = config.image_size
 
@@ -213,12 +276,7 @@ class VideoData(Dataset):
                 this_video_paths.append(item["video"])
 
         for video_path in this_video_paths:
-            decoder = VideoDecoder(
-                video_path,
-                seek_mode="exact",
-                num_ffmpeg_threads=0,
-                device=self.device,
-            )
+            decoder = self.build_video_decoder(video_path)
             total_num_frames = decoder.metadata.num_frames
             this_video_lengths.append(max(0, total_num_frames - self.frames + 1))
 
@@ -241,6 +299,22 @@ class VideoData(Dataset):
         start_frame = idx - total_frame + self.video_lengths[video_idx]
         return video_idx, start_frame
 
+    @staticmethod
+    @lru_cache(maxsize=16)
+    def _build_video_decoder(video_path, target_fps, device="cpu"):
+        decoder = VideoDecoder(
+            video_path,
+            # Interestingly `exact` mode takes less than approximate when we load the whole video
+            seek_mode="exact",
+            # Allow FFmpeg decide on the number of threads for efficiency
+            num_ffmpeg_threads=0,
+            device=device,
+        )
+        return ResampledVideoDecoder(decoder, target_fps)
+
+    def build_video_decoder(self, video_path):
+        return self._build_video_decoder(video_path, self.fps, self.device)
+
     def read_video_torchcodec(self, video_idx: int, start_frame: int):
         """
         Decode the video with torchcodec decoder.
@@ -254,16 +328,9 @@ class VideoData(Dataset):
         """
         video_path = self.video_paths[video_idx]
 
-        decoder = VideoDecoder(
-            video_path,
-            # Interestingly `exact` mode takes less than approximate when we load the whole video
-            seek_mode="exact",
-            # Allow FFmpeg decide on the number of threads for efficiency
-            num_ffmpeg_threads=0,
-            device=self.device,
-        )
-
+        decoder = self.build_video_decoder(video_path)
         indices = list(range(start_frame, start_frame + self.frames))
+
         video = decoder.get_frames_at(indices=indices).data.contiguous()
         video = self.apply_transformations(video)
         return video
