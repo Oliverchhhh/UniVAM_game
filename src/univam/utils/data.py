@@ -1,11 +1,14 @@
+import json
+import math
 import os
 import random
 
 import jsonlines
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL.Image import Resampling
-from torch.utils.data import Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
 from torchcodec.decoders import VideoDecoder
 from torchvision.transforms import functional as F
 
@@ -290,3 +293,317 @@ class VideoData(Dataset):
                 overwatch.error(f"read {self.video_paths[video_idx]}, start_frame: {start_frame} error")
                 idx = random.randint(0, self.length - 1)
         return inputs
+
+
+def collate_fn(inputs):
+    videos = torch.stack([input["video"] for input in inputs])
+    return {"videos": videos}
+
+
+def worker_init_fn(worker_id):
+    seed = 33 + worker_id
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+class InfiniteDistributedSampler(DistributedSampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True):
+        """
+        无限循环分布式采样器。
+        :param dataset: 数据集
+        :param num_replicas: 总共的设备数量
+        :param rank: 当前设备的 rank
+        :param shuffle: 是否随机打乱
+        """
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
+        self._epoch = 0
+
+    def __iter__(self):
+        """
+        无限循环返回索引。
+        """
+        while True:
+            self.set_epoch(self._epoch)
+            self._epoch += 1
+            indices = super().__iter__()
+            yield from indices
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+class InfiniteMultiTaskBatchSampler(BatchSampler):
+    def __init__(self, datasets, batch_size, sample_per_dataset, shuffle=True):
+        """
+        多任务批量采样器，支持 Lightning 的分布式模式。
+        :param datasets: 多个数据集的列表
+        :param batch_size: 每个 batch 的大小
+        :param drop_last: 是否丢弃最后一个不足 batch_size 的 batch
+        """
+        self.datasets = datasets
+        self.batch_size = batch_size
+        self.num_datasets = len(self.datasets)
+        self.samples_per_dataset = sample_per_dataset
+        # self.remaining_samples = batch_size % self.num_datasets
+        self.dataset_lengths = [len(dataset) for dataset in self.datasets]
+
+        self.cumulative_sizes = [0] + self.dataset_lengths
+
+        for i in range(1, len(self.cumulative_sizes)):
+            self.cumulative_sizes[i] += self.cumulative_sizes[i - 1]
+
+        self.cur_idx = 0
+
+        # 为每个数据集创建无限采样器
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+        self.samplers = [
+            InfiniteDistributedSampler(dataset, num_replicas=self.num_replicas, rank=self.rank, shuffle=shuffle)
+            for dataset in datasets
+        ]
+        self.iterators = [iter(sampler) for sampler in self.samplers]
+
+    def __iter__(self):
+        """
+        无限生成每个 batch 的样本索引。
+        """
+        while True:
+            batch = []
+            for i in range(len(self.iterators)):
+                iterator = self.iterators[i]
+                for _ in range(self.samples_per_dataset[i]):
+                    batch.append(next(iterator) + self.cumulative_sizes[i])
+            yield batch
+
+    def __len__(self):
+        return sum(self.dataset_lengths)
+
+
+class FiniteMultiTaskBatchSampler(BatchSampler):
+    def __init__(self, datasets, batch_size, sample_per_dataset, drop_last=False, shuffle=True):
+        self.datasets = datasets
+        self.batch_size = batch_size
+        self.samples_per_dataset = sample_per_dataset
+        self.dataset_lengths = [len(dataset) for dataset in datasets]
+        self.cumulative_sizes = [0] + self.dataset_lengths
+
+        for i in range(1, len(self.cumulative_sizes)):
+            self.cumulative_sizes[i] += self.cumulative_sizes[i - 1]
+
+        self.drop_last = drop_last
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+
+        # 初始化标准分布式采样器
+        self.samplers = [
+            DistributedSampler(dataset, num_replicas=self.num_replicas, rank=self.rank, shuffle=shuffle)
+            for dataset in datasets
+        ]
+        self.iterators = [iter(sampler) for sampler in self.samplers]
+        # 计算每个数据集还剩多少样本
+        self.remaining_samples = [len(sampler) for sampler in self.samplers]
+
+    def __iter__(self):
+        iterators = [iter(sampler) for sampler in self.samplers]
+        remaining_samples = self.remaining_samples.copy()
+
+        while sum(remaining_samples) > 0:
+            batch = []
+            for i, iterator in enumerate(iterators):
+                num_samples = min(self.samples_per_dataset[i], remaining_samples[i])
+                for _ in range(num_samples):
+                    try:
+                        idx = next(iterator)
+                        batch.append(idx + self.cumulative_sizes[i])
+                        remaining_samples[i] -= 1
+                    except StopIteration:
+                        remaining_samples[i] = 0
+                        break  # 当前dataset采样完毕
+
+            if len(batch) == 0:
+                break
+
+            # 根据drop_last判断batch大小
+            if self.drop_last and len(batch) < self.batch_size:
+                break
+
+            yield batch
+
+    def __len__(self):
+        # 总的batch数量（近似值）
+        total_samples = sum(self.dataset_lengths)
+        if self.drop_last:
+            return total_samples // self.batch_size
+        else:
+            return (total_samples + self.batch_size - 1) // self.batch_size
+
+
+class MultiDatasetWrapper(Dataset):
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.dataset_lengths = [len(ds) for ds in datasets]
+
+    def __len__(self):
+        return sum(self.dataset_lengths)
+
+    def __getitem__(self, index):
+        cumulative_sizes = 0
+        for dataset, length in zip(self.datasets, self.dataset_lengths):
+            if index < cumulative_sizes + length:
+                return dataset[index - cumulative_sizes]
+            cumulative_sizes += length
+        raise IndexError("Index out of range")
+
+
+def load_unsampler_datasets_from_json(
+    config,
+    json_path,
+    flip_p,
+    local_batch_size,
+    num_workers=8,
+    is_infinite=True,
+    shuffle=True,
+    drop_last=False,
+    device="cpu",
+):
+    dataset = VideoData(config, flip_p=flip_p, device=device)
+
+    with open(json_path, "r") as f:
+        config = json.load(f)
+    dataset_paths = config["datasets"]
+
+    for dataset_path in dataset_paths:
+        dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
+        dataset.add(dataset_path)
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+
+    if is_infinite:
+        sampler = InfiniteDistributedSampler(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            sampler=sampler,
+            drop_last=drop_last,
+            worker_init_fn=worker_init_fn,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            worker_init_fn=worker_init_fn,
+        )
+
+    return dataloader
+
+
+def load_multi_datasets_form_json(
+    config,
+    json_path,
+    flip_p,
+    local_batch_size,
+    num_workers=8,
+    is_infinite=True,
+    shuffle=True,
+    drop_last=False,
+    make_single_dataset=False,
+    device="cpu",
+):
+    if make_single_dataset:
+        return load_unsampler_datasets_from_json(
+            config=config,
+            json_path=json_path,
+            flip_p=flip_p,
+            local_batch_size=local_batch_size,
+            num_workers=num_workers,
+            is_infinite=is_infinite,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            device=device,
+        )
+
+    with open(json_path, "r") as f:
+        config = json.load(f)
+    dataset_paths = config["datasets"]
+    ratios = config["ratios"]
+
+    assert abs(sum(ratios) - 1.0) < 1e-6, "Ratios must sum to 1.0"
+    assert len(ratios) == len(dataset_paths), "Each dataset must have a corresponding ratio"
+
+    datasets = []
+
+    for dataset_path in dataset_paths:
+        dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
+        dataset = VideoData(config, flip_p=flip_p, device=device)
+        dataset.add(dataset_path)
+        datasets.append(dataset)
+
+    sample_per_dataset = [max(1, math.floor(r * local_batch_size)) for r in ratios]
+
+    total = sum(sample_per_dataset)
+    if total < local_batch_size:
+        sample_per_dataset[-1] += local_batch_size - total
+    elif total > local_batch_size:
+        sample_per_dataset[-1] -= total - local_batch_size
+
+    wrapped_dataset = MultiDatasetWrapper(datasets)
+
+    if is_infinite:
+        batch_sampler = InfiniteMultiTaskBatchSampler(
+            datasets, local_batch_size, sample_per_dataset=sample_per_dataset, shuffle=shuffle
+        )
+    else:
+        batch_sampler = FiniteMultiTaskBatchSampler(
+            datasets, local_batch_size, sample_per_dataset=sample_per_dataset, shuffle=shuffle, drop_last=drop_last
+        )
+
+    dataloader = DataLoader(
+        wrapped_dataset,
+        num_workers=num_workers,
+        batch_sampler=batch_sampler,
+        collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
+    )
+
+    return dataloader
+
+
+if __name__ == "__main__":
+    from univam.utils.args import load_args
+
+    args = load_args()
+
+    # test for single dataset
+    dataset = VideoData(args.data)
+    dataset.add(metadata_path="jsons/train_debug_part_0.jsonl")
+
+    dataloader = DataLoader(dataset, batch_size=4, num_workers=0, collate_fn=collate_fn, shuffle=True, drop_last=False)
+    data = next(iter(dataloader))
+
+    print(f"Dataset length: {len(dataset)}")
+    print(f"Video shape: {data['videos'].shape}")
+
+    # test for multi datasets / dataloader
+    dataloader = load_multi_datasets_form_json(
+        args.data,
+        json_path="jsons/train_debug.json",
+        flip_p=0,
+        local_batch_size=32,
+        num_workers=0,
+        is_infinite=False,
+        shuffle=False,
+        drop_last=False,
+        make_single_dataset=True,
+    )
+
+    data = next(iter(dataloader))
+
+    print(f"Dataloader length (Batches): {len(dataloader)}")
+    print(f"Video shape: {data['videos'].shape}")

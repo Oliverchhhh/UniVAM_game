@@ -13,13 +13,13 @@ class MLPProjector(nn.Module):
         self.patches = patches
         self.channels = channels
 
-        self.hidden_dim: int = args.projector.hidden_dim
-        self.cross_attention_dim: int = args.projector.cross_attention_dim
-        self.output_align_dim: int = args.projector.output_align_dim
+        self.hidden_dim: int = args.hidden_dim
+        self.cross_attention_dim: int = args.cross_attention_dim
+        self.output_align_dim: int = args.output_align_dim
 
-        self.num_token: int = args.projector.num_token
-        self.num_attn_layers: int = args.projector.num_attn_layers
-        self.num_attn_compress_layers: int = args.projector.num_attn_compress_layers
+        self.num_token: int = args.num_token
+        self.num_attn_layers: int = args.num_attn_layers
+        self.num_attn_compress_layers: int = args.num_attn_compress_layers
         self.compress_dims = self._generate_compress_dims()
 
         self.compress_layers = nn.ModuleList(
@@ -148,11 +148,11 @@ class QformerProjector(nn.Module):
         self.patches = patches
         self.channels = channels
 
-        self.hidden_dim = args.projector.hidden_dim
-        self.output_align_dim = args.projector.output_align_dim
+        self.hidden_dim = args.hidden_dim
+        self.output_align_dim = args.output_align_dim
 
-        self.num_query_token = args.projector.num_token
-        self.num_attn_layers = args.projector.num_attn_layers
+        self.num_query_token = args.num_token
+        self.num_attn_layers = args.num_attn_layers
 
         self.query_tokens = nn.Parameter(torch.randn(1, self.num_query_token, self.hidden_dim))
 
@@ -189,30 +189,46 @@ class QformerProjector(nn.Module):
 if __name__ == "__main__":
     from fvcore.nn import FlopCountAnalysis
 
+    from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
     from univam.utils.args import load_args
 
     args = load_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # video_feature_extractor = Qwen3VLVideoFeatureExtractor(args.video_feature_extractor).to(device)
+
+    video_feature_extractor = Qwen3VLVideoFeatureExtractor(
+        args.video_feature_extractor,
+        frames=args.data.frames,
+        image_size=args.data.image_size,
+    ).to(device)
 
     if args.projector.type == "mlp":
-        # model = MLPProjector(args, video_feature_extractor.patches, video_feature_extractor.channels).to(device)
-        model = MLPProjector(args, 2640, 4096).to(device)
+        model = MLPProjector(
+            args.projector,
+            patches=video_feature_extractor.patches,
+            channels=video_feature_extractor.out_hidden_size,
+        ).to(device)
         print(f"Token compression process: {model.compress_dims}")
     elif args.projector.type == "qformer":
-        # model = QformerProjector(args, video_feature_extractor.patches, video_feature_extractor.channels).to(device)
-        model = QformerProjector(args, 2640, 4096).to(device)
+        model = QformerProjector(
+            args.projector,
+            patches=video_feature_extractor.patches,
+            channels=video_feature_extractor.out_hidden_size,
+        ).to(device)
     else:
         raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
 
-    video_pooler_feature = torch.randn(2640, 4096).unsqueeze(0).to(device)
+    video_pooler_feature = (
+        torch.randn(video_feature_extractor.patches, video_feature_extractor.out_hidden_size).unsqueeze(0).to(device)
+    )
+
     compressed_embeds = model(video_pooler_feature)
 
     total_params = sum(p.numel() for p in model.parameters())
     flops = FlopCountAnalysis(model, video_pooler_feature).total()
 
-    print(f"video_pooler_feature.shape: {video_pooler_feature.shape}")
     print(f"Model type: {args.projector.type}")
+    print(f"Video_pooler_feature shape: {video_pooler_feature.shape}")
     print(f"Total params: {total_params / 1e6:.2f} M")
-    print(f"compressed_embeds.shape: {compressed_embeds.shape}")
+    print(f"Compressed_embeds shape: {compressed_embeds.shape}")
     print(f"FLOPs: {flops / 1e9:.2f} GFLOPs")

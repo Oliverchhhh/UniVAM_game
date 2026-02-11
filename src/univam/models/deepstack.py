@@ -88,16 +88,16 @@ class Qwen3VLVisionModel(nn.Module):
             use_postshuffle_norm=False,
         )
 
-        self.deepstack_visual_indexes = config.deepstack_visual_indexes
-        self.deepstack_merger_list = nn.ModuleList(
-            [
-                Qwen3VLVisionPatchMerger(
-                    config=config,
-                    use_postshuffle_norm=True,
-                )
-                for _ in range(len(config.deepstack_visual_indexes))
-            ]
-        )
+        # self.deepstack_visual_indexes = config.deepstack_visual_indexes
+        # self.deepstack_merger_list = nn.ModuleList(
+        #     [
+        #         Qwen3VLVisionPatchMerger(
+        #             config=config,
+        #             use_postshuffle_norm=True,
+        #         )
+        #         for _ in range(len(config.deepstack_visual_indexes))
+        #     ]
+        # )
 
         self.gradient_checkpointing = False
 
@@ -256,7 +256,7 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
         super().__init__()
         self.vision_model = Qwen3VLVisionModel(config)
         ckpt = torch.load(config.ckpt_path, map_location="cpu")
-        self.vision_model.load_state_dict(ckpt)
+        self.vision_model.load_state_dict(ckpt, strict=False)
 
         self.patch_size = config.patch_size
         self.merge_size = config.spatial_merge_size
@@ -320,26 +320,37 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
 
 
 if __name__ == "__main__":
+    from fvcore.nn import FlopCountAnalysis
+
     from univam.utils.args import load_args
     from univam.utils.data import VideoData
 
     args = load_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = Qwen3VLVideoFeatureExtractor(
         args.video_feature_extractor,
+        frames=args.data.frames,
         image_size=args.data.image_size,
-    )
+    ).to(device)
 
+    # get real data via Dataset
     data = VideoData(args.data)
     data.video_paths = ["tests/examples/video_24fps_256x256.mp4"]
-    video = data.read_video_torchcodec(0, 0)
+    video = data.read_video_torchcodec(0, 0).to(device)
     video = video.unsqueeze(0)
     videos = torch.cat([video] * 2, dim=0)
 
     pixel_values_videos, video_grid_thw = model.preprocess(videos)
 
-    print(pixel_values_videos.shape)
-    print(video_grid_thw.shape)
-
     pooler_feature = model(pixel_values_videos, video_grid_thw)
 
-    print(pooler_feature.shape)
+    total_params = sum(p.numel() for p in model.parameters())
+    flops = FlopCountAnalysis(model, (pixel_values_videos, video_grid_thw)).total()
+
+    print(f"Total params: {total_params / 1e6:.2f} M")
+    print(f"pixel_values_video shape: {pixel_values_videos.shape}")
+    print(f"video_grid_thw shape: {video_grid_thw.shape}")
+    print(f"Pooler feature shape: {pooler_feature.shape}")
+    print(f"FLOPs: {flops / 1e9:.2f} GFLOPs")
