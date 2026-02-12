@@ -453,7 +453,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
-        self.patch_embedding_mlp = nn.Linear(in_channels * patch_size[0] * patch_size[1] * patch_size[2], inner_dim)
+        self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
+        # self.patch_embedding_mlp = nn.Linear(in_channels * patch_size[0] * patch_size[1] * patch_size[2], inner_dim)
 
         # 2. Condition embeddings
         self.condition_embedder = TimeVideoActionEmbedding(
@@ -497,15 +498,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states_action: Optional[torch.Tensor] = None,
     ):
         B, C, T, H, W = hidden_states_video.shape
-        hidden_states_video = rearrange(
-            hidden_states_video,
-            "b c (t p1) (h p2) (w p3) -> b (t h w) (c p1 p2 p3)",
-            p1=self.patch_size[0],
-            p2=self.patch_size[1],
-            p3=self.patch_size[2],
-        )
 
-        hidden_states = hidden_states_video
+        hidden_states_video = self.patch_embedding(hidden_states_video)
+        hidden_states = hidden_states_video.flatten(2).transpose(1, 2)
 
         if hidden_states_action is not None:
             # TODO follow the action encoder/tokenizer rules
@@ -517,25 +512,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             hidden_states = torch.cat([hidden_states, hidden_states_action], dim=1)
             action_token_nums = hidden_states_action[1]
 
-        hidden_states = self.patch_embedding_mlp(hidden_states)  # [B, tokens, dim]
-
-        rotary_emb = self.rope(grid_id)  # [B, tokens, (H//p2)*(W//p3)]
-        rotary_emb = rotary_emb[:, :, None]  # [B, tokens, 1, (H//p2)*(W//p3)]
-
-        # latent_time_steps = torch.repeat_interleave(
-        #     timesteps,
-        #     (H // self.patch_size[1]) * (W // self.patch_size[2]),
-        #     dim=1,
-        # )  # [B, tokens]
+        rotary_emb = self.rope(grid_id)[:, :, None]  # [B, tokens, 1, (H//p2)*(W//p3)]
 
         temb, timestep_proj, encoder_hidden_states_video, encoder_hidden_states_action = self.condition_embedder(
             timestep=timestep,
             encoder_hidden_states_video=encoder_hidden_states_video,
             encoder_hidden_states_action=encoder_hidden_states_action,
         )
-        
-        timestep_proj = timestep_proj[:, None, :]                            # [B, 1, 6*inner_dim]
-        timestep_proj = timestep_proj.expand(-1, hidden_states.shape[1], -1) # [B, tokens, 6*inner_dim]
+
+        timestep_proj = timestep_proj[:, None, :]  # [B, 1, 6*inner_dim]
+        timestep_proj = timestep_proj.expand(-1, hidden_states.shape[1], -1)  # [B, tokens, 6*inner_dim]
         timestep_proj = timestep_proj.unflatten(2, (6, -1))
 
         for block in self.blocks:
@@ -564,7 +550,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 w=W,
             )
         else:
-            hidden_states = self.proj_out(hidden_states)
+            hidden_states_video = self.proj_out(hidden_states)
             hidden_states_video = rearrange(
                 hidden_states_video,
                 "b (t h w) (c p1 p2 p3) -> b c (t p1) (h p2) (w p3)",
@@ -620,7 +606,7 @@ if __name__ == "__main__":
         output_loading_info=True,
         low_cpu_mem_usage=False,
     )
-    
+
     DiT = DiT.to(device)
 
     grid_id = get_mesh_id(
