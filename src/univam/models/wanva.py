@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Optional, Tuple
 
@@ -10,7 +11,11 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
+from diffusers.schedulers import DDIMScheduler, DDPMScheduler, FlowMatchEulerDiscreteScheduler, PNDMScheduler
 from flash_attn import flash_attn_func
+
+from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
+from univam.models.projector import MLPProjector, QformerProjector
 
 
 def custom_sdpa(q, k, v):
@@ -276,7 +281,7 @@ class WanAttention(torch.nn.Module):
         super().__init__()
         if attn_mode == "sdpa":
             self.attn_op = custom_sdpa
-        elif attn_mode == "falsh_attention_2":
+        elif attn_mode == "flash_attention_2":
             self.attn_op = flash_attn_func
         else:
             raise ValueError(f"Unsupported attention mode: {attn_mode}, only support torch and flashattn")
@@ -569,7 +574,47 @@ class Wan22VisionActionModel(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
 
-        self.vae = VAVAE(config.model_path)
+        self.video_feature_extractor = Qwen3VLVideoFeatureExtractor(
+            config.video_feature_extractor,
+            frames=config.data.frames,
+            image_size=config.data.image_size,
+        )
+
+        if config.projector.type == "mlp":
+            self.projector = MLPProjector(args, self.vision_backbone.patches, self.vision_backbone.channels)
+        elif config.projector.type == "qformer":
+            self.projector = QformerProjector(args, self.vision_backbone.patches, self.vision_backbone.channels)
+        else:
+            raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
+
+        self.vavae = VAVAE(config.model_path)
+
+        self.DiT = WanTransformer3DModel.from_pretrained(
+            config.wanva.model_path,
+            subfolder="transformer",
+            patch_size=config.patch_size,
+            num_attention_heads=config.num_attention_heads,
+            video_tokens=config.projector.tokens,
+            attn_mode=config.attn_mode,
+            low_cpu_mem_usage=False,
+            ignore_mismatched_sizes=True,
+        )
+
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
+        self.scheduler_copy = copy.deepcopy(self.scheduler)
+
+        tr_noise_scheduler = DDPMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+        if args.dit.eval_scheduler == "ddpm":
+            noise_scheduler = DDPMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+        elif args.dit.eval_scheduler == "ddim":
+            noise_scheduler = DDIMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+            tr_noise_scheduler = DDIMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+        else:
+            noise_scheduler = PNDMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+        self.tr_noise_scheduler = tr_noise_scheduler
+        self.val_noise_scheduler = noise_scheduler
+
+        self.height, self.width = config.data.image_size
 
 
 if __name__ == "__main__":
@@ -581,16 +626,20 @@ if __name__ == "__main__":
     args = load_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    va_vae = VAVAE(args.wanva.model_path).to(device)
+    bsz = 1
 
     # get real data via Dataset
     data = VideoData(args.data)
     data.video_paths = ["tests/examples/lingbot.mp4"]
     video = data.read_video_torchcodec(0, 0)
     video = video.unsqueeze(0)
-    videos = torch.cat([video] * 1, dim=0)
+    videos = torch.cat([video] * bsz, dim=0).to(device=device, dtype=dtype)
     videos = rearrange(videos, "b f c h w -> b c f h w")
+
+    # test for VAVAE
+    va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
 
     video_latents = va_vae.encode(videos)
     decode_videos = va_vae.decode(video_latents)
@@ -599,31 +648,35 @@ if __name__ == "__main__":
     print(f"video_latents.shape: {video_latents.shape}")
     print(f"decode_videos.shape: {decode_videos.shape}")
 
-    DiT, loading_info = WanTransformer3DModel.from_pretrained(
+    # test for WanTransformer3DModel
+    DiT = WanTransformer3DModel.from_pretrained(
         args.wanva.model_path,
         subfolder="transformer",
-        video_tokens=8,
-        output_loading_info=True,
+        patch_size=args.wanva.patch_size,
+        num_attention_heads=args.wanva.num_attention_heads,
+        video_tokens=args.projector.num_token,
+        attn_mode=args.wanva.attn_mode,
         low_cpu_mem_usage=False,
+        ignore_mismatched_sizes=True,
     )
-
-    DiT = DiT.to(device)
+    DiT = DiT.to(device=device, dtype=dtype)
 
     grid_id = get_mesh_id(
-        f=video_latents.shape[-3] // 1,
-        h=video_latents.shape[-2] // 2,
-        w=video_latents.shape[-1] // 2,
+        f=video_latents.shape[-3] // args.wanva.patch_size[0],
+        h=video_latents.shape[-2] // args.wanva.patch_size[1],
+        w=video_latents.shape[-1] // args.wanva.patch_size[2],
         t=0,
         f_w=1,
         f_shift=0,
         action=False,
     ).unsqueeze(0)
+    grid_id = torch.cat([grid_id] * bsz, dim=0).to(device=device, dtype=dtype)
 
-    timesteps = torch.ones([video_latents.shape[2]], dtype=torch.float32, device=device) * 0
+    timestep = torch.ones((bsz), dtype=torch.float32, device=device) * 0
 
-    timestep = torch.ones((video_latents.shape[0]), dtype=torch.float32, device=device) * 0
-
-    encoder_hidden_states_video = torch.randn((1, 8, 4096), device=device)
+    encoder_hidden_states_video = torch.randn(
+        (bsz, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
+    )
 
     hidden_states_video, hidden_states_action = DiT(
         grid_id=grid_id,
@@ -633,15 +686,3 @@ if __name__ == "__main__":
     )
 
     print(f"hidden_states_video.shape: {hidden_states_video.shape}")
-
-    # from diffusers import WanPipeline
-
-    # pipe = WanPipeline.from_pretrained(args.wanva.model_path)
-    # pipe(
-    #     num_frames=5,
-    #     height=256,
-    #     width=256,
-    #     prompt_embeds=torch.randn(1, 8, 4096),
-    #     negative_prompt_embeds=torch.randn(1, 8, 4096),
-    # )
-    # print(1)

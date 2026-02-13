@@ -17,6 +17,9 @@ projector:
   cross_attention_dim: 2048
 
 wanva:
+  patch_size: [1, 2, 2]
+  num_attention_heads: 12
+  attn_mode: flash_attention_2
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
