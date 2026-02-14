@@ -1,6 +1,7 @@
 import copy
+import inspect
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -12,10 +13,19 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from diffusers.schedulers import DDIMScheduler, DDPMScheduler, FlowMatchEulerDiscreteScheduler, PNDMScheduler
+from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+from diffusers.utils.torch_utils import randn_tensor
+from einops import rearrange
 from flash_attn import flash_attn_func
+from tqdm.auto import tqdm
 
 from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
 from univam.models.projector import MLPProjector, QformerProjector
+from univam.utils.data import check_tensor
+from univam.utils.overwatch import initialize_overwatch
+
+
+overwatch = initialize_overwatch(__name__)
 
 
 def custom_sdpa(q, k, v):
@@ -40,6 +50,42 @@ def get_mesh_id(f, h, w, t, f_w=1, f_shift=0, action=False):
     return grid_id
 
 
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    sigmas: Optional[List[float]] = None,
+    **kwargs,
+):
+    if timesteps is not None and sigmas is not None:
+        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    elif sigmas is not None:
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if not accept_sigmas:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+
 class VAVAE(nn.Module):
     def __init__(self, model_path) -> None:
         super().__init__()
@@ -50,12 +96,6 @@ class VAVAE(nn.Module):
 
         self.register_buffer("latent_mean", torch.tensor(self.video_vae.config.latents_mean).view(1, -1, 1, 1, 1))
         self.register_buffer("latent_std", torch.tensor(self.video_vae.config.latents_std).view(1, -1, 1, 1, 1))
-
-    def to(self, *args, **kwargs):
-        model_converted = super().to(*args, **kwargs)
-        self.device = next(self.parameters()).device
-        self.dtype = next(self.parameters()).dtype
-        return model_converted
 
     def align_video(self, videos):
         """
@@ -93,12 +133,11 @@ class VAVAE(nn.Module):
         std = self.latent_std.to(video_latents.dtype)
 
         video_latents = (video_latents - mean) / std
-        video_latents = video_latents.to(dtype=self.dtype)
 
         if actions is None:
             return video_latents
         else:
-            action_latents = actions.to(dtype=self.dtype)
+            action_latents = actions
             return video_latents, action_latents
 
     def decode(self, video_latents: torch.Tensor, action_latents: torch.Tensor | None = None):
@@ -111,7 +150,6 @@ class VAVAE(nn.Module):
         std = self.latent_std.to(video_latents.dtype)
 
         video_latents = video_latents * std + mean
-        video_latents = video_latents.to(dtype=self.dtype)
         videos = self.video_vae.decode(video_latents, return_dict=False)[0]
 
         videos = self.inverse_align_video(videos)
@@ -119,7 +157,7 @@ class VAVAE(nn.Module):
         if action_latents is None:
             return videos
         else:
-            actions = action_latents.to(dtype=self.dtype)
+            actions = action_latents
             return videos, actions
 
 
@@ -198,7 +236,7 @@ class TimeVideoActionEmbedding(nn.Module):
         # action_embedder
         self.action_embedder = None
         if action_embed_dim is not None:
-            self.image_embedder = ActionEmbedding(action_embed_dim, dim, pos_embed_seq_len=action_tokens)
+            self.action_embedder = ActionEmbedding(action_embed_dim, dim, pos_embed_seq_len=action_tokens)
 
     def forward(
         self,
@@ -218,6 +256,7 @@ class TimeVideoActionEmbedding(nn.Module):
         timestep_proj = self.time_proj(self.act_fn(temb))
 
         encoder_hidden_states_video = self.video_embedder(encoder_hidden_states_video)
+        check_tensor(encoder_hidden_states_video, "encoder_hidden_states_video")
         if encoder_hidden_states_action is not None:
             encoder_hidden_states_action = self.action_embedder(encoder_hidden_states_action)
 
@@ -282,7 +321,11 @@ class WanAttention(torch.nn.Module):
         if attn_mode == "sdpa":
             self.attn_op = custom_sdpa
         elif attn_mode == "flash_attention_2":
-            self.attn_op = flash_attn_func
+            if torch.cuda.is_available():
+                self.attn_op = flash_attn_func
+            else:
+                self.attn_op = custom_sdpa
+                overwatch.warning("GPU not available. Fall back to `sdpa`")
         else:
             raise ValueError(f"Unsupported attention mode: {attn_mode}, only support torch and flashattn")
 
@@ -581,108 +624,434 @@ class Wan22VisionActionModel(nn.Module):
         )
 
         if config.projector.type == "mlp":
-            self.projector = MLPProjector(args, self.vision_backbone.patches, self.vision_backbone.channels)
+            self.projector = MLPProjector(
+                config.projector,
+                self.video_feature_extractor.patches,
+                self.video_feature_extractor.out_hidden_size,
+            )
         elif config.projector.type == "qformer":
-            self.projector = QformerProjector(args, self.vision_backbone.patches, self.vision_backbone.channels)
+            self.projector = QformerProjector(
+                config.projector,
+                self.video_feature_extractor.patches,
+                self.video_feature_extractor.out_hidden_size,
+            )
         else:
-            raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
+            raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
-        self.vavae = VAVAE(config.model_path)
+        self.vavae = VAVAE(config.wanva.model_path)
+        self.vae_scale_factor_spatial = self.vavae.video_vae.config.scale_factor_spatial
+        # self.vae_scale_factor_temporal = self.vavae.video_vae.config.scale_factor_temporal
 
-        self.DiT = WanTransformer3DModel.from_pretrained(
+        self.transformer3d = WanTransformer3DModel.from_pretrained(
             config.wanva.model_path,
             subfolder="transformer",
-            patch_size=config.patch_size,
-            num_attention_heads=config.num_attention_heads,
-            video_tokens=config.projector.tokens,
-            attn_mode=config.attn_mode,
+            patch_size=config.wanva.patch_size,
+            num_attention_heads=config.wanva.num_attention_heads,
+            video_tokens=config.projector.num_token,
+            attn_mode=config.wanva.attn_mode,
             low_cpu_mem_usage=False,
             ignore_mismatched_sizes=True,
         )
 
+        target_modules = ["video_embedder.ff", "action_embedder.ff"]
+        for name, module in self.transformer3d.named_modules():
+            if (
+                any(target in name for target in target_modules)
+                and isinstance(module, torch.nn.Linear)
+                and torch.isnan(module.weight).any()
+            ):
+                overwatch.warning(f"Reinitializing: f{name}")
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+        for name, param in self.transformer3d.named_parameters():
+            if torch.isnan(param).any():
+                overwatch.error(f"NaN param: {name}, {param.shape}, {param.device}")
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
         self.scheduler_copy = copy.deepcopy(self.scheduler)
 
-        tr_noise_scheduler = DDPMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
-        if args.dit.eval_scheduler == "ddpm":
-            noise_scheduler = DDPMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
-        elif args.dit.eval_scheduler == "ddim":
-            noise_scheduler = DDIMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
-            tr_noise_scheduler = DDIMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+        eval_scheduler = getattr(config.wanva, "eval_scheduler", "ddpm")
+        tr_noise_scheduler = DDPMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
+        if eval_scheduler == "ddpm":
+            noise_scheduler = DDPMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
+        elif eval_scheduler == "ddim":
+            noise_scheduler = DDIMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
+            tr_noise_scheduler = DDIMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
         else:
-            noise_scheduler = PNDMScheduler.from_pretrained(args.dit.sd3.local_ckpt, subfolder="scheduler")
+            noise_scheduler = PNDMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
         self.tr_noise_scheduler = tr_noise_scheduler
         self.val_noise_scheduler = noise_scheduler
 
         self.height, self.width = config.data.image_size
+        self.frames = config.data.frames
+        self.aligned_frames = self._aligned_frames(self.frames)
+
+        self.seed = getattr(config, "seed", 33)
+        self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
+        self.num_inference_steps = getattr(config.wanva, "num_inference_steps", 50)
+
+        self.weighting_scheme = getattr(config.wanva, "weighting_scheme", "logit_normal")
+        self.logit_mean = getattr(config.wanva, "logit_mean", 0.0)
+        self.logit_std = getattr(config.wanva, "logit_std", 1.0)
+        self.model_scale = getattr(config.wanva, "logit_mean", 1.29)
+
+        self.token_dropout = getattr(config.wanva, "token_dropout", False)
+        self.num_token = config.projector.num_token
+
+    def _aligned_frames(self, frames: int) -> int:
+        remainder = (frames - 1) % self.vavae.pad_chunk_size
+        if remainder != 0:
+            frames += self.vavae.pad_chunk_size - remainder
+        return frames
+
+    def to(self, *args, **kwargs):
+        model_converted = super().to(*args, **kwargs)
+        self.device = next(self.parameters()).device
+        self.dtype = next(self.transformer3d.parameters()).dtype
+        return model_converted
+
+    def train(self, *args):
+        super().train(*args)
+        self.set_trainable_params()
+
+    def set_trainable_params(self):
+        self.transformer3d.train()
+        self.transformer3d.requires_grad_(True)
+
+        self.projector.train()
+        self.projector.requires_grad_(True)
+
+        self.vavae.eval()
+        self.vavae.requires_grad_(False)
+
+        self.video_feature_extractor.eval()
+        self.video_feature_extractor.requires_grad_(False)
+
+    def progress_bar(self, iterable=None, total=None):
+        if not hasattr(self, "_progress_bar_config"):
+            self._progress_bar_config = {}
+        elif not isinstance(self._progress_bar_config, dict):
+            raise ValueError(
+                f"`self._progress_bar_config` should be of type `dict`, but is {type(self._progress_bar_config)}."
+            )
+
+        if iterable is not None:
+            return tqdm(iterable, ncols=150, dynamic_ncols=False, **self._progress_bar_config)
+        elif total is not None:
+            return tqdm(total=total, ncols=150, dynamic_ncols=False, **self._progress_bar_config)
+        else:
+            raise ValueError("Either `total` or `iterable` has to be defined.")
+
+    def get_sigmas(self, timesteps, n_dim=5, dtype=torch.float32):
+        sigmas = self.scheduler_copy.sigmas.to(device=self.device, dtype=dtype)
+        schedule_timesteps = self.scheduler_copy.timesteps.to(self.device)
+        timesteps = timesteps.to(self.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        if latents is not None:
+            return latents.to(device=device, dtype=dtype)
+
+        shape = (
+            batch_size,
+            num_channels_latents,
+            self.aligned_frames,
+            height // self.vae_scale_factor_spatial,
+            width // self.vae_scale_factor_spatial,
+        )
+
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return latents
+
+    def _make_grid_id(self, latents, dtype, action=False):
+        f = latents.shape[-3] // self.transformer3d.patch_size[0]
+        h = latents.shape[-2] // self.transformer3d.patch_size[1]
+        w = latents.shape[-1] // self.transformer3d.patch_size[2]
+
+        grid_id = get_mesh_id(
+            f=f,
+            h=h,
+            w=w,
+            t=0,
+            f_w=1,
+            f_shift=0,
+            action=action,
+        ).unsqueeze(0)
+
+        # assume videos are same shape
+        grid_id = torch.cat([grid_id] * latents.shape[0], dim=0).to(device=latents.device, dtype=dtype)
+        return grid_id
+
+    def encode(self, videos: torch.Tensor, do_classifier_free_guidance: bool = False):
+        dtype = next(self.projector.parameters()).dtype
+        videos = videos.to(device=self.device, dtype=dtype)
+
+        pixel_values_videos, video_grid_thw = self.video_feature_extractor.preprocess(videos)
+        video_pooler_feature = self.video_feature_extractor(pixel_values_videos, video_grid_thw)
+        check_tensor(video_pooler_feature, "video_pooler_feature")
+
+        video_embeds = self.projector(video_pooler_feature)
+        check_tensor(video_embeds, "video_embeds")
+
+        if self.token_dropout:
+            dropout_range = torch.randint(1, self.num_token + 1, ())
+            video_embeds = video_embeds[:, :dropout_range]
+
+        if do_classifier_free_guidance:
+            negative_prompt_embeds = torch.zeros_like(video_embeds)
+            video_embeds = torch.cat([negative_prompt_embeds, video_embeds])
+
+        video_embeds = video_embeds.to(dtype=dtype)
+        return video_embeds
+
+    def train_step(
+        self, inputs: Dict[str, Any], outputs: Dict[str, Any], criterion: nn.Module = None
+    ) -> Dict[str, Any]:
+        videos: torch.Tensor = inputs["videos"]
+
+        batch_size = videos.shape[0]
+
+        video_embeds = self.encode(videos)
+
+        video_vae = rearrange(videos, "b t c h w -> b c t h w")
+        video_latents = self.vavae.encode(video_vae)
+        video_latents = video_latents.to(dtype=self.dtype)
+        check_tensor(video_latents, "video_latents")
+
+        noise = torch.randn_like(video_latents, dtype=self.dtype)
+
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=self.weighting_scheme,
+            batch_size=batch_size,
+            logit_mean=self.logit_mean,
+            logit_std=self.logit_std,
+            mode_scale=self.model_scale,
+        )
+
+        indices = (u * self.scheduler_copy.config.num_train_timesteps).long()
+        timesteps = self.scheduler_copy.timesteps[indices].to(device=video_latents.device)
+
+        sigmas = self.get_sigmas(timesteps, n_dim=video_latents.ndim, dtype=video_latents.dtype)
+        noisy_latents = (1.0 - sigmas) * video_latents + sigmas * noise
+
+        grid_ids = self._make_grid_id(noisy_latents, dtype=noisy_latents.dtype)
+        model_pred_video_latents, _ = self.transformer3d(
+            grid_id=grid_ids,
+            timestep=timesteps,
+            hidden_states_video=noisy_latents,
+            encoder_hidden_states_video=video_embeds,
+        )
+        check_tensor(model_pred_video_latents, "model_pred_video_latents", check_bound=100, check_std=10)
+
+        weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas)
+        target = noise - video_latents
+
+        if criterion is None:
+            outputs["target"] = target
+            return outputs
+
+        loss = criterion(weighting, model_pred_video_latents, target)
+        outputs["loss"] = loss
+        return outputs
+
+    def eval_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
+        videos = inputs["videos"]
+        generator = inputs["generator"]
+
+        do_classifier_free_guidance = self.guidance_scale > 1.0
+        video_embeds = self.encode(videos, do_classifier_free_guidance=do_classifier_free_guidance)
+
+        timesteps, num_inference_steps = retrieve_timesteps(
+            scheduler=self.scheduler, num_inference_steps=self.num_inference_steps, device=self.device, timesteps=None
+        )
+
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+
+        num_channels_latents = self.transformer3d.config.in_channels
+
+        latents = self.prepare_latents(
+            batch_size=videos.shape[0],
+            num_channels_latents=num_channels_latents,
+            height=self.height,
+            width=self.width,
+            dtype=self.dtype,
+            device=self.device,
+            generator=generator,
+            latents=None,
+        )
+
+        grid_ids = self._make_grid_id(latents, dtype=latents.dtype)
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                grid_model_input = torch.cat([grid_ids] * 2) if do_classifier_free_guidance else grid_ids
+
+                timestep = t.expand(latent_model_input.shape[0])
+                noise_pred_video, _ = self.transformer3d(
+                    grid_id=grid_model_input,
+                    timestep=timestep,
+                    hidden_states_video=latent_model_input,
+                    encoder_hidden_states_video=video_embeds,
+                )
+
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred_video.chunk(2)
+                    noise_pred_video = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                latents = self.scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        latents = latents.to(dtype=self.dtype)
+        gen_videos = self.vavae.decode(latents)
+
+        outputs["videos"] = gen_videos
+        return outputs
+
+    def forward(self, inputs, **kwargs):
+        outputs = {}
+
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.seed)
+        inputs["generator"] = generator
+
+        if self.training:
+            outputs = self.train_step(inputs, outputs, **kwargs)
+        else:
+            outputs = self.eval_step(inputs, outputs, **kwargs)
+
+        inputs.pop("generator", None)
+        return outputs
+
+
+class FlopsWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, videos, **kwargs):
+        inputs = {"videos": videos}
+        return self.model(inputs, **kwargs)
 
 
 if __name__ == "__main__":
-    from einops import rearrange
+    from fvcore.nn import FlopCountAnalysis
 
     from univam.utils.args import load_args
-    from univam.utils.data import VideoData
+    from univam.utils.data import VideoData, set_seed
+    from univam.utils.optim import get_criterion
 
     args = load_args()
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    bsz = 1
+    batch_size = 1
 
     # get real data via Dataset
     data = VideoData(args.data)
     data.video_paths = ["tests/examples/lingbot.mp4"]
     video = data.read_video_torchcodec(0, 0)
     video = video.unsqueeze(0)
-    videos = torch.cat([video] * bsz, dim=0).to(device=device, dtype=dtype)
-    videos = rearrange(videos, "b f c h w -> b c f h w")
+    videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 
-    # test for VAVAE
-    va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
+    # # >>> start test for VAVAE <<<
+    # va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
 
-    video_latents = va_vae.encode(videos)
-    decode_videos = va_vae.decode(video_latents)
+    # videos = rearrange(videos, "b f c h w -> b c f h w")
+    # video_latents = va_vae.encode(videos)
+    # decode_videos = va_vae.decode(video_latents)
 
-    print(f"videos.shape: {videos.shape}")
-    print(f"video_latents.shape: {video_latents.shape}")
-    print(f"decode_videos.shape: {decode_videos.shape}")
+    # print(f"videos.shape: {videos.shape}")
+    # print(f"video_latents.shape: {video_latents.shape}")
+    # print(f"decode_videos.shape: {decode_videos.shape}")
+    # # >>> end test for VAVAE <<<
 
-    # test for WanTransformer3DModel
-    DiT = WanTransformer3DModel.from_pretrained(
-        args.wanva.model_path,
-        subfolder="transformer",
-        patch_size=args.wanva.patch_size,
-        num_attention_heads=args.wanva.num_attention_heads,
-        video_tokens=args.projector.num_token,
-        attn_mode=args.wanva.attn_mode,
-        low_cpu_mem_usage=False,
-        ignore_mismatched_sizes=True,
+    # # >>> start test for WanTransformer3DModel <<<
+    # transfomrer3d = WanTransformer3DModel.from_pretrained(
+    #     args.wanva.model_path,
+    #     subfolder="transformer",
+    #     patch_size=args.wanva.patch_size,
+    #     num_attention_heads=args.wanva.num_attention_heads,
+    #     video_tokens=args.projector.num_token,
+    #     attn_mode=args.wanva.attn_mode,
+    #     low_cpu_mem_usage=False,
+    #     ignore_mismatched_sizes=True,
+    # )
+    # transfomrer3d = transfomrer3d.to(device=device, dtype=dtype)
+
+    # grid_id = get_mesh_id(
+    #     f=video_latents.shape[-3] // args.wanva.patch_size[0],
+    #     h=video_latents.shape[-2] // args.wanva.patch_size[1],
+    #     w=video_latents.shape[-1] // args.wanva.patch_size[2],
+    #     t=0,
+    #     f_w=1,
+    #     f_shift=0,
+    #     action=False,
+    # ).unsqueeze(0)
+    # grid_id = torch.cat([grid_id] * batch_size, dim=0).to(device=device, dtype=dtype)
+
+    # timestep = torch.ones((batch_size), dtype=torch.float32, device=device) * 0
+
+    # encoder_hidden_states_video = torch.randn(
+    #     (batch_size, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
+    # )
+
+    # hidden_states_video, hidden_states_action = transfomrer3d(
+    #     grid_id=grid_id,
+    #     timestep=timestep,
+    #     hidden_states_video=video_latents,
+    #     encoder_hidden_states_video=encoder_hidden_states_video,
+    # )
+
+    # print(f"hidden_states_video.shape: {hidden_states_video.shape}")
+    # # >>> end test for WanTransformer3DModel <<<
+
+    # # >>> start main test for Wan22VisionActionModel <<<
+    model = Wan22VisionActionModel(args).to(device=device, dtype=dtype)
+    model = FlopsWrapper(model)
+
+    criterion = get_criterion(
+        loss_type="diffusion",
+        reduction="mean",
     )
-    DiT = DiT.to(device=device, dtype=dtype)
 
-    grid_id = get_mesh_id(
-        f=video_latents.shape[-3] // args.wanva.patch_size[0],
-        h=video_latents.shape[-2] // args.wanva.patch_size[1],
-        w=video_latents.shape[-1] // args.wanva.patch_size[2],
-        t=0,
-        f_w=1,
-        f_shift=0,
-        action=False,
-    ).unsqueeze(0)
-    grid_id = torch.cat([grid_id] * bsz, dim=0).to(device=device, dtype=dtype)
+    total_params = sum(p.numel() for p in model.parameters())
 
-    timestep = torch.ones((bsz), dtype=torch.float32, device=device) * 0
+    # train part
+    model.train()
+    train_outputs = model(videos, criterion=criterion)
+    train_flops = FlopCountAnalysis(model, videos).total()
 
-    encoder_hidden_states_video = torch.randn(
-        (bsz, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
-    )
+    # eval part
+    # model.eval()
+    # eval_outputs = model(videos)
+    # eval_flops = FlopCountAnalysis(model, videos).total()
 
-    hidden_states_video, hidden_states_action = DiT(
-        grid_id=grid_id,
-        timestep=timestep,
-        hidden_states_video=video_latents,
-        encoder_hidden_states_video=encoder_hidden_states_video,
-    )
+    print(">>>>> general part <<<<<")
+    print(f"Total params: {total_params / 1e6:.2f} M")
+    print(f"Inputs shape: {videos.shape}")
 
-    print(f"hidden_states_video.shape: {hidden_states_video.shape}")
+    print(">>>>> train part <<<<<<")
+    print(f"FLOPs: {train_flops / 1e9:.2f} GFLOPs")
+    print(f"Loss: {train_outputs['loss']}")
+
+    # print(">>>>> eval part <<<<<")
+    # print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
+    # print(f"Output shape: {eval_outputs['videos'].shape}")
