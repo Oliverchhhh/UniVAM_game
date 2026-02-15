@@ -74,7 +74,7 @@ def calculate_rfid(pred, target, device="cpu"):
     pred = pred.reshape(B * T, C, H, W)
     target = target.reshape(B * T, C, H, W)
 
-    weights = os.environ.get("PRETRAINED_MODEL_PATH", "..") + "/inception_v3/inception_v3.pth"
+    weights = os.environ.get("PRETRAINED_MODEL_PATH", "../models") + "/inception_v3/inception_v3.pth"
     extractor = InceptionV3Features(weights=weights, device=device)
 
     dtype = next(extractor.parameters()).dtype
@@ -247,8 +247,8 @@ class Timer:
 
 
 if __name__ == "__main__":
-    pred = torch.rand(8, 3, 256, 256)
-    target = torch.rand(8, 3, 256, 256)
+    pred = torch.rand(8, 4, 3, 256, 256)
+    target = torch.rand(8, 4, 3, 256, 256)
 
     print(f"PSNR: {calculate_psnr(pred, target):.4f}")
     print(f"SSIM: {calculate_ssim(pred, target):.4f}")

@@ -190,6 +190,15 @@ def check_tensor(obj, name, check_bound=1e4, check_std=1e3, _visited=None, force
     return problem_found
 
 
+def get_loader_info(dataset_len, epochs, bsz, gradient_accumulate_steps):
+    images_per_gpu = bsz
+    images_per_batch = bsz * overwatch.world_size()
+    iter_per_ep = dataset_len // (bsz * overwatch.world_size() * gradient_accumulate_steps)
+    num_iters = iter_per_ep * epochs
+    loader_info = (images_per_gpu, images_per_batch, iter_per_ep, num_iters)
+    return loader_info
+
+
 class ResampledVideoDecoder:
     """
     A wrapper over VideoDecoder that provides temporal resampling
@@ -536,8 +545,8 @@ def load_unsampler_datasets_from_json(
     dataset = VideoData(config, flip_p=flip_p, device=device)
 
     with open(json_path, "r") as f:
-        config = json.load(f)
-    dataset_paths = config["datasets"]
+        meta_infos = json.load(f)
+    dataset_paths = meta_infos["datasets"]
 
     for dataset_path in dataset_paths:
         dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
@@ -597,9 +606,9 @@ def load_multi_datasets_form_json(
         )
 
     with open(json_path, "r") as f:
-        config = json.load(f)
-    dataset_paths = config["datasets"]
-    ratios = config["ratios"]
+        meta_infos = json.load(f)
+    dataset_paths = meta_infos["datasets"]
+    ratios = meta_infos["ratios"]
 
     assert abs(sum(ratios) - 1.0) < 1e-6, "Ratios must sum to 1.0"
     assert len(ratios) == len(dataset_paths), "Each dataset must have a corresponding ratio"
@@ -660,7 +669,7 @@ if __name__ == "__main__":
     # test for multi datasets / dataloader
     dataloader = load_multi_datasets_form_json(
         args.data,
-        json_path="jsons/train_debug.json",
+        json_path=args.data.train_json_path,
         flip_p=0,
         local_batch_size=32,
         num_workers=0,

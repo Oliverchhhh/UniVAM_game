@@ -50,7 +50,8 @@ class Trainer:
 
         self.seed = args.seed
         self.task_name = args.task_name
-        self.img_size = args.data.img_size
+        self.fps = args.data.fps
+        self.image_size = args.data.image_size
         self.log_dir = os.path.join(args.log_dir, args.task_name, args.projector.type)
         self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name, args.projector.type)
 
@@ -288,8 +289,8 @@ class Trainer:
         eval_meter = Meter()
         eval_timer = Timer()
 
-        label_imgs = []
-        pred_imgs = []
+        label_videos = []
+        pred_videos = []
 
         with torch.no_grad():
             eval_loader = (
@@ -304,19 +305,20 @@ class Trainer:
                     metric_and_loss[k] = self.reduce_mean(v)
                 eval_meter.update(metric_and_loss)
 
-                label_img = inputs["images"]
+                label_video = inputs["videos"]
+                pred_video = outputs["videos"]
 
-                pred_img = self.model.inv_vae_transform(outputs["images"])
-                pred_img = torch.clamp(pred_img, 0, 1)
+                label_video = torch.clamp((label_video + 1) / 2, 0, 1)
+                pred_video = torch.clamp((pred_video + 1) / 2, 0, 1)
 
-                label_imgs.append(label_img)
-                pred_imgs.append(pred_img)
+                label_videos.append(label_video)
+                pred_videos.append(pred_video)
 
-            label_imgs = torch.cat(label_imgs, dim=0)
-            pred_imgs = torch.cat(pred_imgs, dim=0)
+            label_videos = torch.cat(label_videos, dim=0)
+            pred_videos = torch.cat(pred_videos, dim=0)
 
-            psnr = calculate_psnr(pred_imgs, label_imgs)
-            ssim = calculate_ssim(pred_imgs, label_imgs)
+            psnr = calculate_psnr(pred_videos, label_videos)
+            ssim = calculate_ssim(pred_videos, label_videos)
 
             psnr = self.reduce_mean(psnr)
             ssim = self.reduce_mean(ssim)
@@ -332,14 +334,6 @@ class Trainer:
             overwatch.info(f"SSIM: {eval_meter.avg['val/ssim']:.4f}")
             # overwatch.info(f"rFID: {calculate_rfid(pred_imgs, label_imgs):.4f}")
 
-            np_images = np.stack([np.asarray(img.permute(0, 2, 1).cpu().float()) for img in pred_imgs])
-            np_gt_images = np.stack([np.asarray(img.permute(0, 2, 1).cpu().float()) for img in label_imgs])
-
-            toimg = T.ToPILImage()
-
-            images = [toimg(img.cpu().float()) for img in pred_imgs]
-            gt_images = [toimg(img.cpu().float()) for img in label_imgs]
-
             if overwatch.is_rank_zero():
                 self.accelerator.log(
                     {
@@ -349,229 +343,49 @@ class Trainer:
                     step=self.global_step,
                 )
 
-                image_path = os.path.join(self.log_dir, "images", str(self.global_step))
-                ensure_directory(os.path.join(image_path))
-                for i in range(len(images)):
-                    images[i].save(os.path.join(image_path, f"{i}_pred.jpeg"))
-                    gt_images[i].save(os.path.join(image_path, f"{i}_gt.jpeg"))
+                video_path = os.path.join(self.log_dir, "videos", str(self.global_step))
+                ensure_directory(video_path)
 
-                if overwatch.is_rank_zero():
-                    self.writer.add_images("validation/pred", np_images, self.global_step, dataformats="NCWH")
-                    self.writer.add_images("validation/gt", np_gt_images, self.global_step, dataformats="NCWH")
+                to_tensor = T.ToTensor()
+                gt_concat_tensors = []
+                pred_concat_tensors = []
+
+                for i in range(pred_videos.shape[0]):
+                    gt_np = (label_videos[i].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+                    pred_np = (pred_videos[i].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+
+                    gt_frames = [Image.fromarray(frame) for frame in gt_np]
+                    pred_frames = [Image.fromarray(frame) for frame in pred_np]
+
+                    widths, heights = zip(*(img.size for img in gt_frames))
+                    total_width = sum(widths)
+                    max_height = max(heights)
+                    gt_concat = Image.new("RGB", (total_width, max_height))
+                    x_offset = 0
+                    for img in pred_frames:
+                        gt_concat.paste(img, (x_offset, 0))
+                        x_offset += img.size[0]
+                    gt_concat.save(os.path.join(video_path, f"{i}_gt_video.jpg"))
+                    gt_concat_tensors.append(to_tensor(gt_concat))
+
+                    widths, heights = zip(*(img.size for img in pred_frames))
+                    total_width = sum(widths)
+                    max_height = max(heights)
+                    pred_concat = Image.new("RGB", (total_width, max_height))
+                    x_offset = 0
+                    for img in pred_frames:
+                        pred_concat.paste(img, (x_offset, 0))
+                        x_offset += img.size[0]
+                    pred_concat.save(os.path.join(video_path, f"{i}_pred_video.jpg"))
+                    pred_concat_tensors.append(to_tensor(pred_concat))
+
+                gt_concat_batch = torch.stack(gt_concat_tensors, dim=0)
+                pred_concat_batch = torch.stack(pred_concat_tensors, dim=0)
+
+                self.writer.add_images("validation/gt", gt_concat_batch, self.global_step, dataformats="NCWH")
+                self.writer.add_images("validation/pred", pred_concat_batch, self.global_step, dataformats="NCWH")
 
         eval_time = eval_timer.elapse(True)
 
         self.model.train()
         return eval_meter, eval_time
-
-    def manually_eval(self, images, batch_size=64):
-        self.model.eval()
-
-        label_imgs = images
-        toimg = T.ToPILImage()
-        transforms = T.Compose([T.Resize(self.img_size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()])
-
-        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
-        ensure_directory(os.path.join(image_path))
-
-        with torch.no_grad():
-            for start_idx in range(0, len(images), batch_size):
-                end_idx = min(start_idx + batch_size, len(images))
-                batch_images = images[start_idx:end_idx]
-
-                tensor_images = torch.stack([transforms(image).to(self.device) for image in batch_images])
-                inputs = {"images": tensor_images}
-
-                inputs = self.prepare_batch(inputs)
-                outputs = self.forward_step(inputs)
-
-                pred_imgs = self.model.inv_vae_transform(outputs["images"])
-                pred_imgs = torch.clamp(pred_imgs, 0, 1)
-
-                overwatch.info(f"PSNR: {calculate_psnr(pred_imgs, tensor_images):.4f}")
-                overwatch.info(f"SSIM: {calculate_ssim(pred_imgs, tensor_images):.4f}")
-                # overwatch.info(f"rFID: {calculate_rfid(pred_imgs, tensor_images):.4f}")
-
-                pred_imgs = [toimg(pred_img.squeeze().cpu()) for pred_img in pred_imgs]
-
-                for idx, pred_img in enumerate(pred_imgs):
-                    pred_img.save(os.path.join(image_path, f"{start_idx + idx}_pred.jpeg"))
-                    label_imgs[idx].save(os.path.join(image_path, f"{start_idx + idx}_gt.jpeg"))
-
-    def interpolation_eval(
-        self,
-        image1,
-        image2,
-        tokens=None,
-        num_interpolation=5,
-        batch_size=None,
-        to_video=False,
-        fps=10,
-        name="interpolation.mp4",
-    ):
-        """
-        对压缩token进行线性插值
-        """
-        self.model.eval()
-
-        transforms = T.Compose([T.Resize(self.img_size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()])
-
-        with torch.no_grad():
-            image1 = transforms(image1).to(self.device).unsqueeze(0)
-            image2 = transforms(image2).to(self.device).unsqueeze(0)
-
-            inputs1 = self.prepare_batch(image1)
-            inputs2 = self.prepare_batch(image2)
-
-            generator = torch.Generator(device=self.device)
-            generator.manual_seed(self.seed)
-
-            outputs = self.model.interpolation_eval(
-                inputs1,
-                inputs2,
-                generator,
-                tokens=tokens,
-                num_interpolation=num_interpolation,
-                batch_size=batch_size,
-            )
-
-        toimg = T.ToPILImage()
-
-        images = []
-        for pred_image in outputs:
-            pred_image = self.model.inv_vae_transform(pred_image)
-            pred_image = torch.clamp(pred_image, 0, 1)
-            images.append(toimg(pred_image.cpu()))
-
-        if to_video:
-            import imageio
-
-            video_path = os.path.join(self.log_dir, "images", str(self.global_step))
-            ensure_directory(video_path)
-            save_path = os.path.join(video_path, name)
-            imageio.mimsave(save_path, images, fps=fps)
-            return
-
-        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
-        ensure_directory(image_path)
-        for i in range(len(images)):
-            images[i].save(os.path.join(image_path, f"interpolation_{i}.jpeg"))
-
-        widths, heights = zip(*(img.size for img in images))
-        total_width = sum(widths)
-        max_height = max(heights)
-
-        combined_image = Image.new("RGB", (total_width, max_height))
-        x_offset = 0
-        for img in images:
-            combined_image.paste(img, (x_offset, 0))
-            x_offset += img.size[0]
-
-        # 保存拼接后的图像
-        combined_image.save(os.path.join(image_path, f"combined_step_{self.global_step}.jpeg"))
-
-    def visualize_token(self, images, batch_size=64, token=0, visualize=False, name="test"):
-        self.model.eval()
-
-        transforms = T.Compose([T.Resize(self.img_size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()])
-        image_embeddings = []
-        with torch.no_grad():
-            for start_idx in range(0, len(images), batch_size):
-                end_idx = min(start_idx + batch_size, len(images))
-                batch_images = images[start_idx:end_idx]
-
-                tensor_images = torch.stack([transforms(image).to(self.device) for image in batch_images])
-
-                projector_images = self.model.projector_feature_extractor(tensor_images)
-                image_embedding = self.model.encode(projector_images)
-                image_embeddings.append(image_embedding)
-
-        image_embeddings = torch.cat(image_embeddings, dim=0)
-
-        X = image_embeddings[:, token, :]
-
-        X = X - X.mean(dim=0, keepdim=True)
-
-        U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-
-        explained_var = S**2
-        explained_ratio = explained_var / explained_var.sum()
-
-        for i in range(5):
-            overwatch.info(f"Token {token}: PC{i + 1}: {explained_ratio[i].item():.4f}")
-
-        lambda_ = explained_var
-        effective_dim = (lambda_.sum() ** 2) / (lambda_**2).sum()
-        overwatch.info(f"Effective dimension: {effective_dim.item()}")
-
-        if visualize:
-            import matplotlib.pyplot as plt
-
-            V2 = Vh[:2]
-            Z = X @ V2.T  # [N, 2]
-
-            Z_np = Z.cpu().numpy()
-
-            plt.figure(figsize=(6, 6))
-            plt.scatter(Z_np[:, 0], Z_np[:, 1], s=5, alpha=0.6)
-
-            for i in range(Z_np.shape[0]):
-                plt.text(Z_np[i, 0], Z_np[i, 1], str(i), fontsize=6, alpha=0.8)
-
-            plt.xlabel("PC1")
-            plt.ylabel("PC2")
-            plt.title("PCA of Image Embeddings")
-            plt.axis("equal")
-            plt.savefig(f"Token{token}_PCA_{name}.png")
-            plt.close()
-
-    def delta_interpolation(self, image, start, end):
-        """
-        进行delta插值
-        """
-        self.model.eval()
-
-        toimg = T.ToPILImage()
-        transforms = T.Compose([T.Resize(self.img_size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()])
-        size = image.size
-
-        with torch.no_grad():
-            start_inputs = transforms(start).to(self.device).unsqueeze(0)
-            end_inputs = transforms(end).to(self.device).unsqueeze(0)
-            image_inputs = transforms(image).to(self.device).unsqueeze(0)
-
-            start_inputs = self.prepare_batch(start_inputs)
-            end_inputs = self.prepare_batch(end_inputs)
-            image_inputs = self.prepare_batch(image_inputs)
-
-            generator = torch.Generator(device=self.device)
-            generator.manual_seed(self.seed)
-
-            outputs = self.model.delta_interpolation(
-                image_inputs,
-                start_inputs,
-                end_inputs,
-                generator,
-            )
-
-        pred_image = self.model.inv_vae_transform(outputs).squeeze(0)
-        pred_image = torch.clamp(pred_image, 0, 1)
-        pred_image = toimg(pred_image.cpu())
-
-        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
-        ensure_directory(os.path.join(image_path))
-
-        pred_image.save(os.path.join(image_path, f"delta_interpolation_{self.global_step}.jpeg"))
-
-        images = [start.resize(size), end.resize(size), image, pred_image.resize(size)]
-        widths, heights = zip(*(img.size for img in images))
-        total_width = sum(widths)
-        max_height = max(heights)
-
-        combined_image = Image.new("RGB", (total_width, max_height))
-        x_offset = 0
-        for img in images:
-            combined_image.paste(img, (x_offset, 0))
-            x_offset += img.size[0]
-
-        combined_image.save(os.path.join(image_path, f"delta_interpolation_combined_{self.global_step}.jpeg"))
