@@ -1,6 +1,7 @@
 import copy
 import inspect
 import math
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -580,10 +581,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 rotary_emb,
             )
 
-        temb_scale_shift_table = self.scale_shift_table[None] + temb[:, None, :]
-        shift, scale = rearrange(temb_scale_shift_table, "b l n c -> b n l c").chunk(2, dim=1)
-        shift = shift.to(hidden_states.device).squeeze(1)
-        scale = scale.to(hidden_states.device).squeeze(1)
+        temb_scale_shift_table = self.scale_shift_table + temb[:, None, :]
+        shift, scale = temb_scale_shift_table.chunk(2, dim=1)
+        shift = shift.to(hidden_states.device)
+        scale = scale.to(hidden_states.device)
         hidden_states = (self.norm_out(hidden_states.float()) * (1.0 + scale) + shift).type_as(hidden_states)
 
         if hidden_states_action is not None:
@@ -639,8 +640,15 @@ class Wan22VisionActionModel(nn.Module):
             raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
         self.vavae = VAVAE(config.wanva.model_path)
-        self.vae_scale_factor_spatial = self.vavae.video_vae.config.scale_factor_spatial
+        # self.vae_scale_factor_spatial = self.vavae.video_vae.config.scale_factor_spatial
         # self.vae_scale_factor_temporal = self.vavae.video_vae.config.scale_factor_temporal
+
+        height, width = config.data.image_size
+        self.frames = config.data.frames
+        self.aligned_frames = self._aligned_frames(self.frames)
+
+        self.vae_height = height // self.vavae.video_vae.config.scale_factor_spatial
+        self.vae_width = width // self.vavae.video_vae.config.scale_factor_spatial
 
         self.transformer3d = WanTransformer3DModel.from_pretrained(
             config.wanva.model_path,
@@ -669,6 +677,8 @@ class Wan22VisionActionModel(nn.Module):
             if torch.isnan(param).any():
                 overwatch.error(f"NaN param: {name}, {param.shape}, {param.device}")
 
+        self.num_channels_latents = self.transformer3d.config.in_channels
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
         self.scheduler_copy = copy.deepcopy(self.scheduler)
 
@@ -684,10 +694,6 @@ class Wan22VisionActionModel(nn.Module):
         self.tr_noise_scheduler = tr_noise_scheduler
         self.val_noise_scheduler = noise_scheduler
 
-        self.height, self.width = config.data.image_size
-        self.frames = config.data.frames
-        self.aligned_frames = self._aligned_frames(self.frames)
-
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
         self.num_inference_steps = getattr(config.wanva, "num_inference_steps", 50)
@@ -695,7 +701,7 @@ class Wan22VisionActionModel(nn.Module):
         self.weighting_scheme = getattr(config.wanva, "weighting_scheme", "logit_normal")
         self.logit_mean = getattr(config.wanva, "logit_mean", 0.0)
         self.logit_std = getattr(config.wanva, "logit_std", 1.0)
-        self.model_scale = getattr(config.wanva, "logit_mean", 1.29)
+        self.model_scale = getattr(config.wanva, "model_scale", 1.29)
 
         self.token_dropout = getattr(config.wanva, "token_dropout", False)
         self.num_token = config.projector.num_token
@@ -704,7 +710,10 @@ class Wan22VisionActionModel(nn.Module):
         remainder = (frames - 1) % self.vavae.pad_chunk_size
         if remainder != 0:
             frames += self.vavae.pad_chunk_size - remainder
-        return frames
+        remainder = (frames - 1) // self.vavae.pad_chunk_size
+        if remainder < 0:
+            raise ValueError(f"frames should not be less than 0, frames: {frames}")
+        return remainder + 1
 
     def to(self, *args, **kwargs):
         model_converted = super().to(*args, **kwargs)
@@ -728,6 +737,40 @@ class Wan22VisionActionModel(nn.Module):
 
         self.video_feature_extractor.eval()
         self.video_feature_extractor.requires_grad_(False)
+
+    def _save_ckpt(self, model_dict: Dict, projector_model_dict: Dict, save_path: str, global_step: int) -> None:
+        exclude_prefixes = ["vavae", "projector", "video_feature_extractor"]
+        save_dict = {"model": {}, "global_step": global_step}
+        for k, v in model_dict.items():
+            if not any(k.startswith(prefix) for prefix in exclude_prefixes):
+                save_dict["model"][k] = v
+        torch.save(save_dict, os.path.join(save_path, "Wan22VAM.pth"))
+        torch.save(projector_model_dict, os.path.join(save_path, "Projector.pth"))
+
+    def _load_ckpt(self, load_path: str) -> int:
+        assert os.path.exists(os.path.join(load_path, "Projector.pth")), f"Projector.pth not found in {load_path}"
+        assert os.path.exists(os.path.join(load_path, "Wan22VAM.pth")), f"Wan22VAM.pth not found in {load_path}"
+        overwatch.warning(f"loading checkpoints from {load_path}")
+
+        def _log_missing_unexpected(title, missing_keys, unexpected_keys):
+            def extract_top_level(keys):
+                return sorted({k.split(".")[0] for k in keys})
+
+            top_missing = extract_top_level(missing_keys)
+            top_unexpected = extract_top_level(unexpected_keys)
+
+            overwatch.warning(f"{title} - Missing top-level keys: {top_missing}")
+            overwatch.warning(f"{title} - Unexpected top-level keys: {top_unexpected}")
+
+        wanvam_ckpt = torch.load(os.path.join(load_path, "Wan22VAM.pth"), map_location="cpu")
+        missing, unexpected = self.load_state_dict(wanvam_ckpt["model"], strict=False)
+        _log_missing_unexpected("Wan22VAM", missing, unexpected)
+
+        projector_ckpt = torch.load(os.path.join(load_path, "Projector.pth"), map_location="cpu")
+        missing, unexpected = self.projector.load_state_dict(projector_ckpt, strict=False)
+        _log_missing_unexpected("Projector", missing, unexpected)
+
+        return wanvam_ckpt["global_step"]
 
     def progress_bar(self, iterable=None, total=None):
         if not hasattr(self, "_progress_bar_config"):
@@ -755,16 +798,16 @@ class Wan22VisionActionModel(nn.Module):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, batch_size, dtype, device, generator, latents=None):
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
         shape = (
             batch_size,
-            num_channels_latents,
+            self.num_channels_latents,
             self.aligned_frames,
-            height // self.vae_scale_factor_spatial,
-            width // self.vae_scale_factor_spatial,
+            self.vae_height,
+            self.vae_width,
         )
 
         if isinstance(generator, list) and len(generator) != batch_size:
@@ -867,6 +910,7 @@ class Wan22VisionActionModel(nn.Module):
         outputs["loss"] = loss
         return outputs
 
+    @torch.no_grad()
     def eval_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
         videos = inputs["videos"]
         generator = inputs["generator"]
@@ -880,13 +924,8 @@ class Wan22VisionActionModel(nn.Module):
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
-        num_channels_latents = self.transformer3d.config.in_channels
-
         latents = self.prepare_latents(
             batch_size=videos.shape[0],
-            num_channels_latents=num_channels_latents,
-            height=self.height,
-            width=self.width,
             dtype=self.dtype,
             device=self.device,
             generator=generator,
@@ -919,6 +958,7 @@ class Wan22VisionActionModel(nn.Module):
 
         latents = latents.to(dtype=self.dtype)
         gen_videos = self.vavae.decode(latents)
+        gen_videos = rearrange(gen_videos, "b c t h w -> b t c h w")
 
         outputs["videos"] = gen_videos
         return outputs
@@ -949,6 +989,78 @@ class FlopsWrapper(nn.Module):
         return self.model(inputs, **kwargs)
 
 
+def test_vavae(args, videos, device, dtype):
+    va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
+
+    videos = rearrange(videos, "b f c h w -> b c f h w")
+    video_latents = va_vae.encode(videos)
+    decode_videos = va_vae.decode(video_latents)
+
+    print(f"videos.shape: {videos.shape}")
+    print(f"video_latents.shape: {video_latents.shape}")
+    print(f"decode_videos.shape: {decode_videos.shape}")
+    return video_latents
+
+
+def test_transformer3d(args, video_latents, device, dtype):
+    batch_size = video_latents.shape[0]
+
+    transformer3d = WanTransformer3DModel.from_pretrained(
+        args.wanva.model_path,
+        subfolder="transformer",
+        patch_size=args.wanva.patch_size,
+        num_attention_heads=args.wanva.num_attention_heads,
+        video_tokens=args.projector.num_token,
+        attn_mode=args.wanva.attn_mode,
+        low_cpu_mem_usage=False,
+        ignore_mismatched_sizes=True,
+    )
+
+    target_modules = ["video_embedder.ff", "action_embedder.ff"]
+    for name, module in transformer3d.named_modules():
+        if (
+            any(target in name for target in target_modules)
+            and isinstance(module, torch.nn.Linear)
+            and torch.isnan(module.weight).any()
+        ):
+            overwatch.warning(f"Reinitializing: f{name}")
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+    for name, param in transformer3d.named_parameters():
+        if torch.isnan(param).any():
+            overwatch.error(f"NaN param: {name}, {param.shape}, {param.device}")
+
+    transformer3d = transformer3d.to(device=device, dtype=dtype)
+
+    grid_id = get_mesh_id(
+        f=video_latents.shape[-3] // args.wanva.patch_size[0],
+        h=video_latents.shape[-2] // args.wanva.patch_size[1],
+        w=video_latents.shape[-1] // args.wanva.patch_size[2],
+        t=0,
+        f_w=1,
+        f_shift=0,
+        action=False,
+    ).unsqueeze(0)
+    grid_id = torch.cat([grid_id] * batch_size, dim=0).to(device=device, dtype=dtype)
+
+    timestep = torch.ones((batch_size), dtype=torch.float32, device=device) * 0
+
+    encoder_hidden_states_video = torch.randn(
+        (batch_size, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
+    )
+
+    hidden_states_video, _ = transformer3d(
+        grid_id=grid_id,
+        timestep=timestep,
+        hidden_states_video=video_latents,
+        encoder_hidden_states_video=encoder_hidden_states_video,
+    )
+
+    print(f"hidden_states_video.shape: {hidden_states_video.shape}")
+
+
 if __name__ == "__main__":
     from fvcore.nn import FlopCountAnalysis
 
@@ -962,7 +1074,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    batch_size = 1
+    batch_size = 8
 
     # get real data via Dataset
     data = VideoData(args.data)
@@ -971,59 +1083,11 @@ if __name__ == "__main__":
     video = video.unsqueeze(0)
     videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 
-    # # >>> start test for VAVAE <<<
-    # va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
+    # video_latents = test_vavae(args, videos, device, dtype)
 
-    # videos = rearrange(videos, "b f c h w -> b c f h w")
-    # video_latents = va_vae.encode(videos)
-    # decode_videos = va_vae.decode(video_latents)
+    # test_transformer3d(args, video_latents, device, dtype)
 
-    # print(f"videos.shape: {videos.shape}")
-    # print(f"video_latents.shape: {video_latents.shape}")
-    # print(f"decode_videos.shape: {decode_videos.shape}")
-    # # >>> end test for VAVAE <<<
-
-    # # >>> start test for WanTransformer3DModel <<<
-    # transfomrer3d = WanTransformer3DModel.from_pretrained(
-    #     args.wanva.model_path,
-    #     subfolder="transformer",
-    #     patch_size=args.wanva.patch_size,
-    #     num_attention_heads=args.wanva.num_attention_heads,
-    #     video_tokens=args.projector.num_token,
-    #     attn_mode=args.wanva.attn_mode,
-    #     low_cpu_mem_usage=False,
-    #     ignore_mismatched_sizes=True,
-    # )
-    # transfomrer3d = transfomrer3d.to(device=device, dtype=dtype)
-
-    # grid_id = get_mesh_id(
-    #     f=video_latents.shape[-3] // args.wanva.patch_size[0],
-    #     h=video_latents.shape[-2] // args.wanva.patch_size[1],
-    #     w=video_latents.shape[-1] // args.wanva.patch_size[2],
-    #     t=0,
-    #     f_w=1,
-    #     f_shift=0,
-    #     action=False,
-    # ).unsqueeze(0)
-    # grid_id = torch.cat([grid_id] * batch_size, dim=0).to(device=device, dtype=dtype)
-
-    # timestep = torch.ones((batch_size), dtype=torch.float32, device=device) * 0
-
-    # encoder_hidden_states_video = torch.randn(
-    #     (batch_size, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
-    # )
-
-    # hidden_states_video, hidden_states_action = transfomrer3d(
-    #     grid_id=grid_id,
-    #     timestep=timestep,
-    #     hidden_states_video=video_latents,
-    #     encoder_hidden_states_video=encoder_hidden_states_video,
-    # )
-
-    # print(f"hidden_states_video.shape: {hidden_states_video.shape}")
-    # # >>> end test for WanTransformer3DModel <<<
-
-    # # >>> start main test for Wan22VisionActionModel <<<
+    # >>> start main test for Wan22VisionActionModel <<<
     model = Wan22VisionActionModel(args).to(device=device, dtype=dtype)
     model = FlopsWrapper(model)
 
@@ -1040,9 +1104,9 @@ if __name__ == "__main__":
     train_flops = FlopCountAnalysis(model, videos).total()
 
     # eval part
-    # model.eval()
-    # eval_outputs = model(videos)
-    # eval_flops = FlopCountAnalysis(model, videos).total()
+    model.eval()
+    eval_outputs = model(videos)
+    eval_flops = FlopCountAnalysis(model, videos).total()
 
     print(">>>>> general part <<<<<")
     print(f"Total params: {total_params / 1e6:.2f} M")
@@ -1052,6 +1116,7 @@ if __name__ == "__main__":
     print(f"FLOPs: {train_flops / 1e9:.2f} GFLOPs")
     print(f"Loss: {train_outputs['loss']}")
 
-    # print(">>>>> eval part <<<<<")
-    # print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
-    # print(f"Output shape: {eval_outputs['videos'].shape}")
+    print(">>>>> eval part <<<<<")
+    print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
+    print(f"Output shape: {eval_outputs['videos'].shape}")
+    # >>> end main test for Wan22VisionActionModel <<<

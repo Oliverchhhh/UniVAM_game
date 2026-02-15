@@ -334,14 +334,10 @@ if __name__ == "__main__":
     args = load_args()
 
     # To infer on a GPU, you can set `_attn_implementation` with "flash_attention_2", which only support fp16 and bf16 data type
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        dtype = torch.bfloat16
-        args._attn_implementation = "flash_attention_2"
-    else:
-        device = torch.device("cpu")
-        dtype = torch.float32
-        args._attn_implementation = "sdpa"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    batch_size = 8
 
     model = Qwen3VLVideoFeatureExtractor(
         args.video_feature_extractor,
@@ -354,7 +350,7 @@ if __name__ == "__main__":
     data.video_paths = ["tests/examples/video_24fps_256x256.mp4"]
     video = data.read_video_torchcodec(0, 0)
     video = video.unsqueeze(0)
-    videos = torch.cat([video] * 2, dim=0)
+    videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 
     pixel_values_videos, video_grid_thw = model.preprocess(videos)
 

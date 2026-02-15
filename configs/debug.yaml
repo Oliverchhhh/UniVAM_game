@@ -23,13 +23,25 @@ wanva:
   num_inference_steps: 50
   patch_size: [1, 2, 2]
   num_attention_heads: 24
-  attn_mode: flash_attention_2 # sdpa | flash_attention_2
+  attn_mode: sdpa # sdpa | flash_attention_2
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
   fps: 24
   frames: 4
   num_workers: 32
-  image_size: [256, 256]
+  image_size: [480, 640]
   train_json_path: ./jsons/train_debug.json
   eval_json_path: ./jsons/eval_debug.json
+
+train:
+  dist: True
+  epochs: 200
+  num_iters: null
+  eval_step: 100000
+  save_step: 100000
+  local_batch_size: 32
+  learning_rate: 3e-4
+  decay: 1e-3
+  ckpt_save_dir: ckpts
+  gradient_accumulate_steps: 1
