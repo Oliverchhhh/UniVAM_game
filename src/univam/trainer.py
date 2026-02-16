@@ -293,12 +293,13 @@ class Trainer:
         pred_videos = []
 
         with torch.no_grad():
-            eval_loader = (
-                tqdm(eval_loader, total=len(eval_loader), ncols=150, dynamic_ncols=False) if use_tqdm else eval_loader
-            )
+            if overwatch.is_rank_zero():
+                eval_loader = tqdm(eval_loader, total=len(eval_loader), ncols=150, dynamic_ncols=False)
+            else:
+                eval_loader = eval_loader
             for inputs in eval_loader:
                 inputs = self.prepare_batch(inputs)
-                outputs = self.forward_step(inputs)
+                outputs = self.forward_step(inputs, use_tqdm=use_tqdm)
                 metric_and_loss = {k: v for k, v in outputs.items() if k.split("_")[0] in ["metric", "loss"]}
 
                 for k, v in metric_and_loss.items():
@@ -316,6 +317,9 @@ class Trainer:
 
             label_videos = torch.cat(label_videos, dim=0)
             pred_videos = torch.cat(pred_videos, dim=0)
+
+            overwatch.warning(f"label_videos.shape: {label_videos.shape}")
+            overwatch.warning(f"pred_videos.shape: {pred_videos.shape}")
 
             psnr = calculate_psnr(pred_videos, label_videos)
             ssim = calculate_ssim(pred_videos, label_videos)
@@ -351,8 +355,8 @@ class Trainer:
                 pred_concat_tensors = []
 
                 for i in range(pred_videos.shape[0]):
-                    gt_np = (label_videos[i].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
-                    pred_np = (pred_videos[i].permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+                    gt_np = (label_videos[i].permute(0, 2, 3, 1).float().cpu().numpy() * 255).astype(np.uint8)
+                    pred_np = (pred_videos[i].permute(0, 2, 3, 1).float().cpu().numpy() * 255).astype(np.uint8)
 
                     gt_frames = [Image.fromarray(frame) for frame in gt_np]
                     pred_frames = [Image.fromarray(frame) for frame in pred_np]
@@ -362,7 +366,7 @@ class Trainer:
                     max_height = max(heights)
                     gt_concat = Image.new("RGB", (total_width, max_height))
                     x_offset = 0
-                    for img in pred_frames:
+                    for img in gt_frames:
                         gt_concat.paste(img, (x_offset, 0))
                         x_offset += img.size[0]
                     gt_concat.save(os.path.join(video_path, f"{i}_gt_video.jpg"))
@@ -382,8 +386,8 @@ class Trainer:
                 gt_concat_batch = torch.stack(gt_concat_tensors, dim=0)
                 pred_concat_batch = torch.stack(pred_concat_tensors, dim=0)
 
-                self.writer.add_images("validation/gt", gt_concat_batch, self.global_step, dataformats="NCWH")
-                self.writer.add_images("validation/pred", pred_concat_batch, self.global_step, dataformats="NCWH")
+                self.writer.add_images("validation/gt", gt_concat_batch, self.global_step, dataformats="NCHW")
+                self.writer.add_images("validation/pred", pred_concat_batch, self.global_step, dataformats="NCHW")
 
         eval_time = eval_timer.elapse(True)
 

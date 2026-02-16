@@ -108,8 +108,8 @@ if __name__ == "__main__":
 
     dataset_path = os.environ.get("DATASETS_PATH", "./datasets")
 
-    train_video_dirs = [os.path.join(dataset_path, "cuphead_videos/train")]
+    train_video_dirs = [os.path.join(dataset_path, "XVLA-Soft-Fold-Videos/train")]
 
-    eval_video_dirs = [os.path.join(dataset_path, "cuphead_videos/eval")]
+    eval_video_dirs = [os.path.join(dataset_path, "XVLA-Soft-Fold-Videos/eval")]
 
-    create_split_jsonl(train_video_dirs, eval_video_dirs, "cuphead", shared_train_num=1, eval_num=1)
+    create_split_jsonl(train_video_dirs, eval_video_dirs, "XVLA", shared_train_num=1, eval_num=1)

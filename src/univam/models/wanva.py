@@ -772,7 +772,7 @@ class Wan22VisionActionModel(nn.Module):
 
         return wanvam_ckpt["global_step"]
 
-    def progress_bar(self, iterable=None, total=None):
+    def progress_bar(self, iterable=None, total=None, use_tqdm=True):
         if not hasattr(self, "_progress_bar_config"):
             self._progress_bar_config = {}
         elif not isinstance(self._progress_bar_config, dict):
@@ -781,9 +781,9 @@ class Wan22VisionActionModel(nn.Module):
             )
 
         if iterable is not None:
-            return tqdm(iterable, ncols=150, dynamic_ncols=False, **self._progress_bar_config)
+            return tqdm(iterable, ncols=150, dynamic_ncols=False, disable=not use_tqdm, **self._progress_bar_config)
         elif total is not None:
-            return tqdm(total=total, ncols=150, dynamic_ncols=False, **self._progress_bar_config)
+            return tqdm(total=total, ncols=150, dynamic_ncols=False, disable=not use_tqdm, **self._progress_bar_config)
         else:
             raise ValueError("Either `total` or `iterable` has to be defined.")
 
@@ -911,7 +911,7 @@ class Wan22VisionActionModel(nn.Module):
         return outputs
 
     @torch.no_grad()
-    def eval_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
+    def eval_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any], use_tqdm: bool = True) -> Dict[str, Any]:
         videos = inputs["videos"]
         generator = inputs["generator"]
 
@@ -934,7 +934,7 @@ class Wan22VisionActionModel(nn.Module):
 
         grid_ids = self._make_grid_id(latents, dtype=latents.dtype)
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=num_inference_steps, use_tqdm=use_tqdm) as progress_bar:
             for i, t in enumerate(timesteps):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 grid_model_input = torch.cat([grid_ids] * 2) if do_classifier_free_guidance else grid_ids

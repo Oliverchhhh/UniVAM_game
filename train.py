@@ -41,6 +41,7 @@ def main(args):
             is_infinite=False,
             shuffle=False,
             drop_last=False,
+            eval_sample_num=args.train.eval_sample_num,
             make_single_dataset=True,
         )
 

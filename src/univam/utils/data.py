@@ -2,8 +2,8 @@ import json
 import math
 import os
 import random
-from functools import lru_cache
 
+# from functools import lru_cache
 import jsonlines
 import numpy as np
 import torch
@@ -261,9 +261,10 @@ class ResampledVideoDecoder:
 
 
 class VideoData(Dataset):
-    def __init__(self, config, flip_p: float = 0.5, device="cpu"):
+    def __init__(self, config, flip_p: float = 0.5, device="cpu", eval_sample_num=None):
         self.flip_p = flip_p
         self.device = device
+        self.eval_sample_num = eval_sample_num
 
         self.fps = config.fps
         self.frames = config.frames
@@ -272,6 +273,7 @@ class VideoData(Dataset):
         self.length = 0
         self.video_paths = []
         self.video_lengths = []
+        self.video_start_indices = []
 
         self.video_mean = torch.tensor([127.5, 127.5, 127.5])
         self.video_std = torch.tensor([127.5, 127.5, 127.5])
@@ -280,6 +282,8 @@ class VideoData(Dataset):
         this_length = 0
         this_video_paths = []
         this_video_lengths = []
+        this_video_start_indices = []
+
         with open(metadata_path, "r+", encoding="utf8") as f:
             for item in jsonlines.Reader(f):
                 this_video_paths.append(item["video"])
@@ -287,29 +291,51 @@ class VideoData(Dataset):
         for video_path in this_video_paths:
             decoder = self.build_video_decoder(video_path)
             total_num_frames = decoder.metadata.num_frames
-            this_video_lengths.append(max(0, total_num_frames - self.frames + 1))
+            valid = max(0, total_num_frames - self.frames + 1)
+
+            if valid <= 0:
+                this_video_lengths.append(0)
+                this_video_start_indices.append([])
+                continue
+
+            if self.eval_sample_num is not None:
+                k = min(self.eval_sample_num, valid)
+                starts = random.sample(range(valid), k)
+
+                this_video_lengths.append(k)
+                this_video_start_indices.append(starts)
+            else:
+                this_video_lengths.append(valid)
+                this_video_start_indices.append(None)
 
         this_length = sum(this_video_lengths)
+
         self.length += this_length
         self.video_paths.extend(this_video_paths)
         self.video_lengths.extend(this_video_lengths)
+        self.video_start_indices.extend(this_video_start_indices)
 
         overwatch.info(f"{this_length} data loaded from {metadata_path}")
 
     def idx_to_video_and_frame(self, idx: int):
         video_idx = -1
         total_frame = 0
-        start_frame = 0
 
         while idx - total_frame >= 0:
             video_idx += 1
             total_frame += self.video_lengths[video_idx]
 
-        start_frame = idx - total_frame + self.video_lengths[video_idx]
+        local_idx = idx - (total_frame - self.video_lengths[video_idx])
+
+        if self.eval_sample_num is not None:
+            start_frame = self.video_start_indices[video_idx][local_idx]
+        else:
+            start_frame = local_idx
+
         return video_idx, start_frame
 
     @staticmethod
-    @lru_cache(maxsize=16)
+    # @lru_cache(maxsize=16)
     def _build_video_decoder(video_path, target_fps, device="cpu"):
         decoder = VideoDecoder(
             video_path,
@@ -540,9 +566,10 @@ def load_unsampler_datasets_from_json(
     is_infinite=True,
     shuffle=True,
     drop_last=False,
+    eval_sample_num=None,
     device="cpu",
 ):
-    dataset = VideoData(config, flip_p=flip_p, device=device)
+    dataset = VideoData(config, flip_p=flip_p, device=device, eval_sample_num=eval_sample_num)
 
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
@@ -589,6 +616,7 @@ def load_multi_datasets_form_json(
     is_infinite=True,
     shuffle=True,
     drop_last=False,
+    eval_sample_num=None,
     make_single_dataset=False,
     device="cpu",
 ):
@@ -602,6 +630,7 @@ def load_multi_datasets_form_json(
             is_infinite=is_infinite,
             shuffle=shuffle,
             drop_last=drop_last,
+            eval_sample_num=eval_sample_num,
             device=device,
         )
 
@@ -617,7 +646,7 @@ def load_multi_datasets_form_json(
 
     for dataset_path in dataset_paths:
         dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
-        dataset = VideoData(config, flip_p=flip_p, device=device)
+        dataset = VideoData(config, flip_p=flip_p, device=device, eval_sample_num=eval_sample_num)
         dataset.add(dataset_path)
         datasets.append(dataset)
 
