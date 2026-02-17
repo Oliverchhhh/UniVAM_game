@@ -180,5 +180,9 @@ jsons/
 logs/
 ckpts/
 *_test_*
+
+# special files
 .sii/
 core*
+scripts/train_mutil.sh
+

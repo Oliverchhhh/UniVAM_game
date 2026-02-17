@@ -57,7 +57,7 @@ def main(args):
             (p for p in model.parameters() if p.requires_grad),
             opt_type="AdamW",
             lr=args.train.learning_rate,
-            betas=(0.9, 0.98),
+            betas=(0.9, 0.999),
             weight_decay=args.train.decay,
         )
 
@@ -69,7 +69,7 @@ def main(args):
         scheduler = WarmupLinearConstantLR(
             optimizer,
             max_iter=(args.train.num_iters // args.train.gradient_accumulate_steps) + 1,
-            warmup_ratio=getattr(args, "warmup_ratio", 0.001),
+            warmup_ratio=getattr(args, "warmup_ratio", 0.01),
         )
 
         trainer = Trainer(args, model, criterion, optimizer, scheduler)

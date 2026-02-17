@@ -46,6 +46,7 @@ class Trainer:
         self.save_step = args.train.save_step
         self.local_batch_size = args.train.local_batch_size
         self.gradient_accumulate_steps = args.train.gradient_accumulate_steps
+        self.max_grad_norm = args.train.max_grad_norm
         self.iter_per_ep = None
 
         self.seed = args.seed
@@ -116,6 +117,8 @@ class Trainer:
         if hasattr(self, "accelerator") and self.accelerator is not None:
             if not self.accelerator.sync_gradients:
                 return
+
+        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
         if optimizer_idx >= 0 and isinstance(self.optimizer, list):
             optimizer = self.optimizer[optimizer_idx]
@@ -317,9 +320,6 @@ class Trainer:
 
             label_videos = torch.cat(label_videos, dim=0)
             pred_videos = torch.cat(pred_videos, dim=0)
-
-            overwatch.warning(f"label_videos.shape: {label_videos.shape}")
-            overwatch.warning(f"pred_videos.shape: {pred_videos.shape}")
 
             psnr = calculate_psnr(pred_videos, label_videos)
             ssim = calculate_ssim(pred_videos, label_videos)

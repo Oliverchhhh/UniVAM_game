@@ -45,4 +45,5 @@ train:
   learning_rate: 3e-4
   decay: 1e-3
   ckpt_save_dir: ckpts
+  max_grad_norm: 1.0
   gradient_accumulate_steps: 1
