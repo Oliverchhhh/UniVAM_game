@@ -2,12 +2,15 @@ import json
 import math
 import os
 import random
+from threading import RLock
 
 # from functools import lru_cache
 import jsonlines
 import numpy as np
 import torch
 import torch.distributed as dist
+from cachetools import cached
+from cachetools.keys import hashkey
 from PIL.Image import Resampling
 from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
 from torchcodec.decoders import VideoDecoder
@@ -17,6 +20,8 @@ from univam.utils.overwatch import initialize_overwatch
 
 
 overwatch = initialize_overwatch(__name__)
+
+lock = RLock()
 
 
 def set_seed(seed: int):
@@ -335,7 +340,7 @@ class VideoData(Dataset):
         return video_idx, start_frame
 
     @staticmethod
-    # @lru_cache(maxsize=16)
+    @cached(cache={}, key=hashkey, lock=lock)
     def _build_video_decoder(video_path, target_fps, device="cpu"):
         decoder = VideoDecoder(
             video_path,

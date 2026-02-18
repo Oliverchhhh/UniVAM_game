@@ -1,8 +1,8 @@
 seed: 33
 do_train: True
 log_dir: logs
-resume: False
-resume_path: null
+resume: True
+resume_path: ckpts/XVLA/qformer/22112
 task_name: XVLA
 
 video_feature_extractor: ${oc.load:configs/qwen3_vl/vision_config_8b.yaml}
@@ -38,8 +38,8 @@ train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 5528
-  save_step: 5528
+  eval_step: 5000
+  save_step: 5000
   local_batch_size: 16
   eval_sample_num: 4
   learning_rate: 3e-4
