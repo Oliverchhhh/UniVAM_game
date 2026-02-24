@@ -34,7 +34,7 @@ def custom_sdpa(q, k, v):
     return out.transpose(1, 2)
 
 
-def get_mesh_id(f, h, w, t, f_w=1, f_shift=0, action=False):
+def get_mesh_id(f, h, w, f_w=1, f_shift=0, action=False):
     f_idx = torch.arange(f_shift, f + f_shift) * f_w
     h_idx = torch.arange(h)
     w_idx = torch.arange(w)
@@ -47,7 +47,6 @@ def get_mesh_id(f, h, w, t, f_w=1, f_shift=0, action=False):
         ww = torch.ones_like(ww) * -1
 
     grid_id = torch.cat([ff.unsqueeze(0), hh.unsqueeze(0), ww.unsqueeze(0)], dim=0).flatten(1)
-    grid_id = torch.cat([grid_id, torch.full_like(grid_id[:1], t)], dim=0)
     return grid_id
 
 
@@ -163,21 +162,14 @@ class VAVAE(nn.Module):
 
 
 class VideoEmbedding(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len=None):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(in_features)
         self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
         self.norm2 = FP32LayerNorm(out_features)
-        if pos_embed_seq_len is not None:
-            self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
-        else:
-            self.pos_embed = None
 
     def forward(self, encoder_hidden_states_video: torch.Tensor) -> torch.Tensor:
-        if self.pos_embed is not None:
-            encoder_hidden_states_video = encoder_hidden_states_video + self.pos_embed
-
         hidden_states = self.norm1(encoder_hidden_states_video)
         hidden_states = self.ff(hidden_states)
         hidden_states = self.norm2(hidden_states)
@@ -186,23 +178,14 @@ class VideoEmbedding(torch.nn.Module):
 
 # TODO: modify to align action
 class ActionEmbedding(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len=None):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(in_features)
         self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
         self.norm2 = FP32LayerNorm(out_features)
-        if pos_embed_seq_len is not None:
-            self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
-        else:
-            self.pos_embed = None
 
     def forward(self, encoder_hidden_states_action: torch.Tensor) -> torch.Tensor:
-        if self.pos_embed is not None:
-            batch_size, seq_len, embed_dim = encoder_hidden_states_action.shape
-            encoder_hidden_states_action = encoder_hidden_states_action.view(-1, 2 * seq_len, embed_dim)
-            encoder_hidden_states_action = encoder_hidden_states_action + self.pos_embed
-
         hidden_states = self.norm1(encoder_hidden_states_action)
         hidden_states = self.ff(hidden_states)
         hidden_states = self.norm2(hidden_states)
@@ -217,8 +200,6 @@ class TimeVideoActionEmbedding(nn.Module):
         time_proj_dim: int,
         video_embed_dim: int,
         action_embed_dim: Optional[int] = None,
-        video_tokens: Optional[int] = None,
-        action_tokens: Optional[int] = None,
     ):
         super().__init__()
 
@@ -231,13 +212,12 @@ class TimeVideoActionEmbedding(nn.Module):
         self.video_embedder = VideoEmbedding(
             in_features=video_embed_dim,
             out_features=dim,
-            pos_embed_seq_len=video_tokens,
         )
 
         # action_embedder
         self.action_embedder = None
         if action_embed_dim is not None:
-            self.action_embedder = ActionEmbedding(action_embed_dim, dim, pos_embed_seq_len=action_tokens)
+            self.action_embedder = ActionEmbedding(action_embed_dim, dim)
 
     def forward(
         self,
@@ -482,9 +462,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         in_channels: int = 48,
         out_channels: int = 48,
         video_dim: int = 4096,
-        video_tokens: Optional[int] = None,
         action_dim: Optional[int] = None,
-        action_tokens: Optional[int] = None,
         freq_dim: int = 256,
         ffn_dim: int = 14336,
         num_layers: int = 30,
@@ -511,9 +489,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             time_freq_dim=freq_dim,
             time_proj_dim=inner_dim * 6,
             video_embed_dim=video_dim,
-            video_tokens=video_tokens,
             action_embed_dim=action_dim,
-            action_tokens=action_tokens,
         )
 
         # 3. Transformer blocks
@@ -655,7 +631,6 @@ class Wan22VisionActionModel(nn.Module):
             subfolder="transformer",
             patch_size=config.wanva.patch_size,
             num_attention_heads=config.wanva.num_attention_heads,
-            video_tokens=config.projector.num_token,
             attn_mode=config.wanva.attn_mode,
             low_cpu_mem_usage=False,
             ignore_mismatched_sizes=True,
@@ -828,7 +803,6 @@ class Wan22VisionActionModel(nn.Module):
             f=f,
             h=h,
             w=w,
-            t=0,
             f_w=1,
             f_shift=0,
             action=action,
@@ -1038,7 +1012,6 @@ def test_transformer3d(args, video_latents, device, dtype):
         f=video_latents.shape[-3] // args.wanva.patch_size[0],
         h=video_latents.shape[-2] // args.wanva.patch_size[1],
         w=video_latents.shape[-1] // args.wanva.patch_size[2],
-        t=0,
         f_w=1,
         f_shift=0,
         action=False,
@@ -1074,7 +1047,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    batch_size = 8
+    batch_size = 2
 
     # get real data via Dataset
     data = VideoData(args.data)

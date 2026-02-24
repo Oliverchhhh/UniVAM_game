@@ -9,8 +9,6 @@ import jsonlines
 import numpy as np
 import torch
 import torch.distributed as dist
-from cachetools import cached
-from cachetools.keys import hashkey
 from PIL.Image import Resampling
 from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
 from torchcodec.decoders import VideoDecoder
@@ -340,7 +338,6 @@ class VideoData(Dataset):
         return video_idx, start_frame
 
     @staticmethod
-    @cached(cache={}, key=hashkey, lock=lock)
     def _build_video_decoder(video_path, target_fps, device="cpu"):
         decoder = VideoDecoder(
             video_path,

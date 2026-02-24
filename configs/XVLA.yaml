@@ -1,8 +1,8 @@
 seed: 33
 do_train: True
 log_dir: logs
-resume: True
-resume_path: ckpts/XVLA/qformer/22112
+resume: False
+resume_path: null
 task_name: XVLA
 
 video_feature_extractor: ${oc.load:configs/qwen3_vl/vision_config_8b.yaml}
