@@ -14,7 +14,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from diffusers.schedulers import DDIMScheduler, DDPMScheduler, FlowMatchEulerDiscreteScheduler, PNDMScheduler
-from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from flash_attn import flash_attn_func
@@ -87,26 +86,30 @@ def retrieve_timesteps(
 
 
 class VAVAE(nn.Module):
-    def __init__(self, model_path) -> None:
+    def __init__(self, model_path, frames) -> None:
         super().__init__()
         self.video_vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
 
-        self.pad_num = 0
+        self.frames = frames
+
         self.pad_chunk_size = 4
+        self.pad_num = self.get_pad_num()
 
         self.register_buffer("latent_mean", torch.tensor(self.video_vae.config.latents_mean).view(1, -1, 1, 1, 1))
         self.register_buffer("latent_std", torch.tensor(self.video_vae.config.latents_std).view(1, -1, 1, 1, 1))
+
+    def get_pad_num(self):
+        remainder = (self.frames - 1) % self.pad_chunk_size
+        if remainder != 0:
+            return self.pad_chunk_size - remainder
+        else:
+            return 0
 
     def align_video(self, videos):
         """
         尾部重复 padding, 使 T 满足 1 + N * pad_chunk_size
         """
-        T = videos.shape[2]
-        self.pad_num = 0
-
-        remainder = (T - 1) % self.pad_chunk_size
-        if remainder != 0:
-            self.pad_num = self.pad_chunk_size - remainder
+        if self.pad_num != 0:
             last_frame = videos[:, :, -1:, :, :]  # [B, C, 1, H, W]
             pad_frames = last_frame.repeat(1, 1, self.pad_num, 1, 1)
             videos = torch.cat([videos, pad_frames], dim=2)
@@ -117,8 +120,10 @@ class VAVAE(nn.Module):
         """
         去掉尾部 padding
         """
-        latents = latents[:, :, : -self.pad_num, :, :]
-        return latents
+        if self.pad_num == 0:
+            return latents
+        else:
+            return latents[:, :, : -self.pad_num, :, :]
 
     def encode(self, videos: torch.Tensor, actions: torch.Tensor | None = None):
         """
@@ -515,7 +520,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def forward(
         self,
         grid_id: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         # TODO deside to cat action tokens or not
         hidden_states_video: torch.Tensor,
         encoder_hidden_states_video: torch.Tensor,
@@ -615,7 +620,7 @@ class Wan22VisionActionModel(nn.Module):
         else:
             raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
-        self.vavae = VAVAE(config.wanva.model_path)
+        self.vavae = VAVAE(config.wanva.model_path, frames=config.data.frames)
         # self.vae_scale_factor_spatial = self.vavae.video_vae.config.scale_factor_spatial
         # self.vae_scale_factor_temporal = self.vavae.video_vae.config.scale_factor_temporal
 
@@ -672,11 +677,6 @@ class Wan22VisionActionModel(nn.Module):
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
         self.num_inference_steps = getattr(config.wanva, "num_inference_steps", 50)
-
-        self.weighting_scheme = getattr(config.wanva, "weighting_scheme", "logit_normal")
-        self.logit_mean = getattr(config.wanva, "logit_mean", 0.0)
-        self.logit_std = getattr(config.wanva, "logit_std", 1.0)
-        self.model_scale = getattr(config.wanva, "model_scale", 1.29)
 
         self.token_dropout = getattr(config.wanva, "token_dropout", False)
         self.num_token = config.projector.num_token
@@ -762,17 +762,6 @@ class Wan22VisionActionModel(nn.Module):
         else:
             raise ValueError("Either `total` or `iterable` has to be defined.")
 
-    def get_sigmas(self, timesteps, n_dim=5, dtype=torch.float32):
-        sigmas = self.scheduler_copy.sigmas.to(device=self.device, dtype=dtype)
-        schedule_timesteps = self.scheduler_copy.timesteps.to(self.device)
-        timesteps = timesteps.to(self.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
-
     def prepare_latents(self, batch_size, dtype, device, generator, latents=None):
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
@@ -834,9 +823,7 @@ class Wan22VisionActionModel(nn.Module):
         video_embeds = video_embeds.to(dtype=dtype)
         return video_embeds
 
-    def train_step(
-        self, inputs: Dict[str, Any], outputs: Dict[str, Any], criterion: nn.Module = None
-    ) -> Dict[str, Any]:
+    def train_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
         videos: torch.Tensor = inputs["videos"]
 
         batch_size = videos.shape[0]
@@ -850,19 +837,15 @@ class Wan22VisionActionModel(nn.Module):
 
         noise = torch.randn_like(video_latents, dtype=self.dtype)
 
-        u = compute_density_for_timestep_sampling(
-            weighting_scheme=self.weighting_scheme,
-            batch_size=batch_size,
-            logit_mean=self.logit_mean,
-            logit_std=self.logit_std,
-            mode_scale=self.model_scale,
-        )
+        timestep_id = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,))
+        timesteps = self.scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)
 
-        indices = (u * self.scheduler_copy.config.num_train_timesteps).long()
-        timesteps = self.scheduler_copy.timesteps[indices].to(device=video_latents.device)
-
-        sigmas = self.get_sigmas(timesteps, n_dim=video_latents.ndim, dtype=video_latents.dtype)
+        sigmas = self.scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device)
+        sigmas = sigmas.view(batch_size, 1, 1, 1, 1)
         noisy_latents = (1.0 - sigmas) * video_latents + sigmas * noise
+
+        # Flow-Matching target
+        target = noise - video_latents
 
         grid_ids = self._make_grid_id(noisy_latents, dtype=noisy_latents.dtype)
         model_pred_video_latents, _ = self.transformer3d(
@@ -873,14 +856,8 @@ class Wan22VisionActionModel(nn.Module):
         )
         check_tensor(model_pred_video_latents, "model_pred_video_latents", check_bound=100, check_std=10)
 
-        weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.weighting_scheme, sigmas=sigmas)
-        target = noise - video_latents
+        loss = torch.nn.functional.mse_loss(model_pred_video_latents, target, reduction="mean")
 
-        if criterion is None:
-            outputs["target"] = target
-            return outputs
-
-        loss = criterion(weighting, model_pred_video_latents, target)
         outputs["loss"] = loss
         return outputs
 
@@ -964,7 +941,7 @@ class FlopsWrapper(nn.Module):
 
 
 def test_vavae(args, videos, device, dtype):
-    va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
+    va_vae = VAVAE(args.wanva.model_path, frames=args.data.frames).to(device=device, dtype=dtype)
 
     videos = rearrange(videos, "b f c h w -> b c f h w")
     video_latents = va_vae.encode(videos)
@@ -1039,7 +1016,6 @@ if __name__ == "__main__":
 
     from univam.utils.args import load_args
     from univam.utils.data import VideoData, set_seed
-    from univam.utils.optim import get_criterion
 
     args = load_args()
     set_seed(args.seed)
@@ -1064,16 +1040,11 @@ if __name__ == "__main__":
     model = Wan22VisionActionModel(args).to(device=device, dtype=dtype)
     model = FlopsWrapper(model)
 
-    criterion = get_criterion(
-        loss_type="diffusion",
-        reduction="mean",
-    )
-
     total_params = sum(p.numel() for p in model.parameters())
 
     # train part
     model.train()
-    train_outputs = model(videos, criterion=criterion)
+    train_outputs = model(videos)
     train_flops = FlopCountAnalysis(model, videos).total()
 
     # eval part

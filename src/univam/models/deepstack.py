@@ -337,7 +337,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    batch_size = 8
+    batch_size = 2
 
     model = Qwen3VLVideoFeatureExtractor(
         args.video_feature_extractor,

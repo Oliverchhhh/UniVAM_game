@@ -4,7 +4,7 @@ from univam.models.wanva import Wan22VisionActionModel
 from univam.trainer import Trainer
 from univam.utils.args import load_args
 from univam.utils.data import get_loader_info, load_multi_datasets_form_json, set_seed
-from univam.utils.optim import WarmupLinearConstantLR, get_criterion, get_optimizer
+from univam.utils.optim import WarmupLinearConstantLR, get_optimizer
 from univam.utils.overwatch import initialize_overwatch
 
 
@@ -82,18 +82,13 @@ def main(args):
             weight_decay=args.train.decay,
         )
 
-        criterion = get_criterion(
-            loss_type="diffusion",
-            reduction="mean",
-        )
-
         scheduler = WarmupLinearConstantLR(
             optimizer,
             max_iter=(args.train.num_iters // args.train.gradient_accumulate_steps) + 1,
             warmup_ratio=getattr(args, "warmup_ratio", 0.01),
         )
 
-        trainer = Trainer(args, model, criterion, optimizer, scheduler)
+        trainer = Trainer(args, model, optimizer, scheduler)
         trainer.setup_model_for_training()
 
         trainer.iter_per_ep = args.train.iter_per_ep

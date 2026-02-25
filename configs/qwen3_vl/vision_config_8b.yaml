@@ -11,5 +11,5 @@ out_hidden_size: 4096
 num_position_embeddings: 2304
 initializer_range: 0.02
 deepstack_visual_indexes: [8, 16, 24]
-_attn_implementation: sdpa # sdpa | flash_attention_2
+_attn_implementation: ${oc.env:ATTN_MODE} # sdpa | flash_attention_2
 model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Qwen/Qwen3-VL-VideoFeatureExtractor/Qwen3-VL-VideoFeatureExtractor-8b.pt

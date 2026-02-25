@@ -23,7 +23,7 @@ wanva:
   num_inference_steps: 50
   patch_size: [1, 2, 2]
   num_attention_heads: 24
-  attn_mode: sdpa # sdpa | flash_attention_2
+  attn_mode: ${oc.env:ATTN_MODE} # sdpa | flash_attention_2
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:

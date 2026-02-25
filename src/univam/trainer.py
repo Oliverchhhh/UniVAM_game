@@ -21,9 +21,8 @@ overwatch = initialize_overwatch(__name__)
 
 
 class Trainer:
-    def __init__(self, args, model: Wan22VisionActionModel, criterion=None, optimizer=None, lr_scheduler=None) -> None:
+    def __init__(self, args, model: Wan22VisionActionModel, optimizer=None, lr_scheduler=None) -> None:
         self.model: Wan22VisionActionModel = model
-        self.criterion = criterion
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
@@ -215,7 +214,7 @@ class Trainer:
                 with self.accelerator.accumulate(self.model):
                     inputs = self.prepare_batch(inputs)
                     check_tensor(inputs, "inputs(prepare_batch)")
-                    outputs = self.forward_step(inputs, criterion=self.criterion)
+                    outputs = self.forward_step(inputs)
                     check_tensor(outputs["loss"], "loss", check_bound=10, check_std=10)
                     self.backward_step(outputs["loss"])
                     self.step()
