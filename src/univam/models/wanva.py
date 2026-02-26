@@ -85,53 +85,32 @@ def retrieve_timesteps(
 
 
 class VAVAE(nn.Module):
-    def __init__(self, model_path, frames) -> None:
+    def __init__(self, model_path) -> None:
         super().__init__()
         self.video_vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
 
-        self.frames = frames
-
-        self.pad_chunk_size = 4
-        self.pad_num = self.get_pad_num()
+        self.chunk_size = 4
 
         self.register_buffer("latent_mean", torch.tensor(self.video_vae.config.latents_mean).view(1, -1, 1, 1, 1))
         self.register_buffer("latent_std", torch.tensor(self.video_vae.config.latents_std).view(1, -1, 1, 1, 1))
 
-    def get_pad_num(self):
-        remainder = (self.frames - 1) % self.pad_chunk_size
-        if remainder != 0:
-            return self.pad_chunk_size - remainder
-        else:
-            return 0
-
-    def align_video(self, videos):
-        """
-        尾部重复 padding, 使 T 满足 1 + N * pad_chunk_size
-        """
-        if self.pad_num != 0:
-            last_frame = videos[:, :, -1:, :, :]  # [B, C, 1, H, W]
-            pad_frames = last_frame.repeat(1, 1, self.pad_num, 1, 1)
-            videos = torch.cat([videos, pad_frames], dim=2)
-
-        return videos
-
-    def inverse_align_video(self, latents):
-        """
-        去掉尾部 padding
-        """
-        if self.pad_num == 0:
-            return latents
-        else:
-            return latents[:, :, : -self.pad_num, :, :]
-
+    @torch.no_grad()
     def encode(self, videos: torch.Tensor, actions: torch.Tensor | None = None):
         """
         Joint VAE encode, assume that actions ~ N(?, ?)
-            videos:  [B, C, T, H, W]
-            actions: [B, C, T, chunk_size, 1]
+            videos:  [B, T, C, H, W]
+            actions: [B, T, C, chunk_size, 1]
         """
-        videos = self.align_video(videos)
+        B, T, C, H, W = videos.shape
+        videos = videos.reshape(B * T, C, 1, H, W)
         video_latents = self.video_vae.encode(videos).latent_dist.sample()
+
+        video_latents = rearrange(
+            video_latents,
+            "(b t) c 1 h w -> b c t h w",
+            b=B,
+            t=T,
+        )
 
         mean = self.latent_mean.to(video_latents.dtype)
         std = self.latent_std.to(video_latents.dtype)
@@ -144,19 +123,29 @@ class VAVAE(nn.Module):
             action_latents = actions
             return video_latents, action_latents
 
+    @torch.no_grad()
     def decode(self, video_latents: torch.Tensor, action_latents: torch.Tensor | None = None):
         """
         Joint VAE decode, assume that actions ~ N(?, ?)
-            videos:  [B, C, F, H, W]
-            actions: [B, C, F, chunk_size, 1]
+            videos:  [B, C, T, H, W]
+            actions: [B, C, T, chunk_size, 1]
         """
+        B, C, T, H, W = video_latents.shape
+
         mean = self.latent_mean.to(video_latents.dtype)
         std = self.latent_std.to(video_latents.dtype)
 
         video_latents = video_latents * std + mean
+
+        video_latents = rearrange(video_latents, "b c t h w -> (b t) c 1 h w")
         videos = self.video_vae.decode(video_latents, return_dict=False)[0]
 
-        videos = self.inverse_align_video(videos)
+        videos = rearrange(
+            videos,
+            "(b t) c 1 h w -> b t c h w",
+            b=B,
+            t=T,
+        )
 
         if action_latents is None:
             return videos
@@ -619,13 +608,12 @@ class Wan22VisionActionModel(nn.Module):
         else:
             raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
-        self.vavae = VAVAE(config.wanva.model_path, frames=config.data.frames)
+        self.vavae = VAVAE(config.wanva.model_path)
         # self.vae_scale_factor_spatial = self.vavae.video_vae.config.scale_factor_spatial
         # self.vae_scale_factor_temporal = self.vavae.video_vae.config.scale_factor_temporal
 
         height, width = config.data.image_size
         self.frames = config.data.frames
-        self.aligned_frames = self._aligned_frames(self.frames)
 
         self.vae_height = height // self.vavae.video_vae.config.scale_factor_spatial
         self.vae_width = width // self.vavae.video_vae.config.scale_factor_spatial
@@ -670,15 +658,6 @@ class Wan22VisionActionModel(nn.Module):
 
         self.token_dropout = getattr(config.wanva, "token_dropout", False)
         self.num_token = config.projector.num_token
-
-    def _aligned_frames(self, frames: int) -> int:
-        remainder = (frames - 1) % self.vavae.pad_chunk_size
-        if remainder != 0:
-            frames += self.vavae.pad_chunk_size - remainder
-        remainder = (frames - 1) // self.vavae.pad_chunk_size
-        if remainder < 0:
-            raise ValueError(f"frames should not be less than 0, frames: {frames}")
-        return remainder + 1
 
     def to(self, *args, **kwargs):
         model_converted = super().to(*args, **kwargs)
@@ -759,7 +738,7 @@ class Wan22VisionActionModel(nn.Module):
         shape = (
             batch_size,
             self.num_channels_latents,
-            self.aligned_frames,
+            self.frames,
             self.vae_height,
             self.vae_width,
         )
@@ -820,31 +799,35 @@ class Wan22VisionActionModel(nn.Module):
 
         video_embeds = self.encode(videos)
 
-        video_vae = rearrange(videos, "b t c h w -> b c t h w")
-        video_latents = self.vavae.encode(video_vae)
+        video_latents = self.vavae.encode(videos)
         video_latents = video_latents.to(dtype=self.dtype)
         check_tensor(video_latents, "video_latents")
 
-        noise = torch.randn_like(video_latents, dtype=self.dtype)
+        first_frame_latents = video_latents[:, 0:1, :, :, :]
+
+        video_noise = torch.randn_like(video_latents, dtype=self.dtype)
 
         timestep_id = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,))
         timesteps = self.scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)
 
         sigmas = self.scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device)
         sigmas = sigmas.view(batch_size, 1, 1, 1, 1)
-        noisy_latents = (1.0 - sigmas) * video_latents + sigmas * noise
+        video_noisy_latents = (1.0 - sigmas) * video_latents + sigmas * video_noise
+        video_noisy_latents[:, 0:1, :, :, :] = first_frame_latents
 
         # Flow-Matching target
-        target = noise - video_latents
+        target = video_noise - video_latents
+        target[:, 0:1, :, :, :] = 0
 
-        grid_ids = self._make_grid_id(noisy_latents, dtype=noisy_latents.dtype)
+        grid_ids = self._make_grid_id(video_noisy_latents, dtype=video_noisy_latents.dtype)
         model_pred_video_latents, _ = self.transformer3d(
             grid_id=grid_ids,
             timestep=timesteps,
-            hidden_states_video=noisy_latents,
+            hidden_states_video=video_noisy_latents,
             encoder_hidden_states_video=video_embeds,
         )
         check_tensor(model_pred_video_latents, "model_pred_video_latents", check_bound=100, check_std=10)
+        model_pred_video_latents[:, 0:1, :, :, :] = 0
 
         loss = torch.nn.functional.mse_loss(model_pred_video_latents, target, reduction="mean")
 
@@ -876,6 +859,11 @@ class Wan22VisionActionModel(nn.Module):
             latents=None,
         )
 
+        first_frame = videos[:, 0:1, :, :, :]
+        first_frame_latents = self.vavae.encode(first_frame)
+
+        latents[:, :, 0:1, :, :] = first_frame_latents
+
         grid_ids = self._make_grid_id(latents, dtype=latents.dtype)
 
         with self.progress_bar(total=num_inference_steps, use_tqdm=use_tqdm) as progress_bar:
@@ -902,7 +890,6 @@ class Wan22VisionActionModel(nn.Module):
 
         latents = latents.to(dtype=self.dtype)
         gen_videos = self.vavae.decode(latents)
-        gen_videos = rearrange(gen_videos, "b c t h w -> b t c h w")
 
         outputs["videos"] = gen_videos
         return outputs
@@ -934,9 +921,8 @@ class FlopsWrapper(nn.Module):
 
 
 def test_vavae(args, videos, device, dtype):
-    va_vae = VAVAE(args.wanva.model_path, frames=args.data.frames).to(device=device, dtype=dtype)
+    va_vae = VAVAE(args.wanva.model_path).to(device=device, dtype=dtype)
 
-    videos = rearrange(videos, "b f c h w -> b c f h w")
     video_latents = va_vae.encode(videos)
     decode_videos = va_vae.decode(video_latents)
 
@@ -1025,7 +1011,7 @@ if __name__ == "__main__":
     video = video.unsqueeze(0)
     videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 
-    video_latents = test_vavae(args, videos, device, dtype)
+    # video_latents = test_vavae(args, videos, device, dtype)
 
     # test_transformer3d(args, video_latents, device, dtype)
 
@@ -1041,9 +1027,9 @@ if __name__ == "__main__":
     train_flops = FlopCountAnalysis(model, videos).total()
 
     # eval part
-    model.eval()
-    eval_outputs = model(videos)
-    eval_flops = FlopCountAnalysis(model, videos).total()
+    # model.eval()
+    # eval_outputs = model(videos)
+    # eval_flops = FlopCountAnalysis(model, videos).total()
 
     print(">>>>> general part <<<<<")
     print(f"Total params: {total_params / 1e6:.2f} M")
@@ -1053,7 +1039,7 @@ if __name__ == "__main__":
     print(f"FLOPs: {train_flops / 1e9:.2f} GFLOPs")
     print(f"Loss: {train_outputs['loss']}")
 
-    print(">>>>> eval part <<<<<")
-    print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
-    print(f"Output shape: {eval_outputs['videos'].shape}")
+    # print(">>>>> eval part <<<<<")
+    # print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
+    # print(f"Output shape: {eval_outputs['videos'].shape}")
     # >>> end main test for Wan22VisionActionModel <<<

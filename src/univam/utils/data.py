@@ -2,9 +2,7 @@ import json
 import math
 import os
 import random
-from threading import RLock
 
-# from functools import lru_cache
 import jsonlines
 import numpy as np
 import torch
@@ -18,8 +16,6 @@ from univam.utils.overwatch import initialize_overwatch
 
 
 overwatch = initialize_overwatch(__name__)
-
-lock = RLock()
 
 
 def set_seed(seed: int):

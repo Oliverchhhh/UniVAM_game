@@ -26,8 +26,8 @@ wanva:
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
-  fps: 6
-  frames: 4
+  fps: 2
+  frames: 5
   num_workers: 32
   image_size: [480, 640]
   train_json_path: ./jsons/train_XVLA.json
@@ -37,9 +37,9 @@ train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 2500
-  save_step: 2500
-  local_batch_size: 16
+  eval_step: 7200
+  save_step: 7200
+  local_batch_size: 4
   eval_sample_num: 4
   learning_rate: 3e-5
   decay: 1e-3

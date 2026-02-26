@@ -29,7 +29,7 @@ data:
   fps: 24
   frames: 5
   num_workers: 32
-  image_size: [480, 640]
+  image_size: [256, 256]
   train_json_path: ./jsons/train_debug.json
   eval_json_path: ./jsons/eval_debug.json
 
