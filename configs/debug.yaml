@@ -18,7 +18,6 @@ projector:
 
 wanva:
   token_dropout: False
-  eval_scheduler: ddpm
   guidance_scale: 1.0
   num_inference_steps: 50
   patch_size: [1, 2, 2]
@@ -28,7 +27,7 @@ wanva:
 
 data:
   fps: 24
-  frames: 4
+  frames: 5
   num_workers: 32
   image_size: [480, 640]
   train_json_path: ./jsons/train_debug.json
@@ -42,7 +41,7 @@ train:
   save_step: 500
   local_batch_size: 16
   eval_sample_num: 4
-  learning_rate: 3e-4
+  learning_rate: 3e-5
   decay: 1e-3
   ckpt_save_dir: ckpts
   max_grad_norm: 1.0

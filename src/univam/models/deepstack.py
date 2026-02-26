@@ -258,11 +258,13 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
         ckpt = torch.load(config.model_path, map_location="cpu")
         self.vision_model.load_state_dict(ckpt, strict=False)
 
+        self.frames = frames
+
         self.patch_size = config.patch_size
         self.merge_size = config.spatial_merge_size
         self.temporal_patch_size = config.temporal_patch_size
 
-        if frames % self.temporal_patch_size != 0:
+        if (frames - 1) % self.temporal_patch_size != 0:
             raise ValueError(
                 f"`frames` ({frames}) must be divisible by `temporal_patch_size` ({self.temporal_patch_size})."
             )
@@ -286,8 +288,11 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
         self.patches = self.grid_t * self.grid_h * self.grid_w // self.merge_size // self.merge_size
         self.out_hidden_size = config.out_hidden_size
 
-    def preprocess(self, videos):
+    def preprocess(self, videos: torch.Tensor):
         B, T, C, H, W = videos.shape
+
+        if T == self.frames:
+            videos = videos[:, 1:, :, :, :]
 
         videos = videos.view(
             B,

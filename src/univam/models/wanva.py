@@ -1,4 +1,3 @@
-import copy
 import inspect
 import math
 import os
@@ -13,7 +12,7 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
-from diffusers.schedulers import DDIMScheduler, DDPMScheduler, FlowMatchEulerDiscreteScheduler, PNDMScheduler
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from flash_attn import flash_attn_func
@@ -660,19 +659,10 @@ class Wan22VisionActionModel(nn.Module):
         self.num_channels_latents = self.transformer3d.config.in_channels
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-        self.scheduler_copy = copy.deepcopy(self.scheduler)
 
-        eval_scheduler = getattr(config.wanva, "eval_scheduler", "ddpm")
-        tr_noise_scheduler = DDPMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-        if eval_scheduler == "ddpm":
-            noise_scheduler = DDPMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-        elif eval_scheduler == "ddim":
-            noise_scheduler = DDIMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-            tr_noise_scheduler = DDIMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-        else:
-            noise_scheduler = PNDMScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-        self.tr_noise_scheduler = tr_noise_scheduler
-        self.val_noise_scheduler = noise_scheduler
+        self.eval_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            config.wanva.model_path, subfolder="scheduler"
+        )
 
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
@@ -824,7 +814,7 @@ class Wan22VisionActionModel(nn.Module):
         return video_embeds
 
     def train_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
-        videos: torch.Tensor = inputs["videos"]
+        videos: torch.Tensor = inputs["videos"]  # [B, T, C, H, W]
 
         batch_size = videos.shape[0]
 
@@ -870,10 +860,13 @@ class Wan22VisionActionModel(nn.Module):
         video_embeds = self.encode(videos, do_classifier_free_guidance=do_classifier_free_guidance)
 
         timesteps, num_inference_steps = retrieve_timesteps(
-            scheduler=self.scheduler, num_inference_steps=self.num_inference_steps, device=self.device, timesteps=None
+            scheduler=self.eval_scheduler,
+            num_inference_steps=self.num_inference_steps,
+            device=self.device,
+            timesteps=None,
         )
 
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.eval_scheduler.order, 0)
 
         latents = self.prepare_latents(
             batch_size=videos.shape[0],
@@ -902,9 +895,9 @@ class Wan22VisionActionModel(nn.Module):
                     noise_pred_uncond, noise_pred_text = noise_pred_video.chunk(2)
                     noise_pred_video = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                latents = self.scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
+                latents = self.eval_scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
 
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.eval_scheduler.order == 0):
                     progress_bar.update()
 
         latents = latents.to(dtype=self.dtype)
@@ -1032,7 +1025,7 @@ if __name__ == "__main__":
     video = video.unsqueeze(0)
     videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 
-    # video_latents = test_vavae(args, videos, device, dtype)
+    video_latents = test_vavae(args, videos, device, dtype)
 
     # test_transformer3d(args, video_latents, device, dtype)
 
