@@ -16,5 +16,4 @@ deepspeed_config:
 
   offload_optimizer_device: none
   offload_param_device: none
-  gradient_accumulation_steps: 1
   gradient_clipping: 1.0

@@ -1,25 +1,24 @@
 import inspect
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed, WanTransformerBlock
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
-from flash_attn import flash_attn_func
 from tqdm.auto import tqdm
 
 from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
 from univam.models.projector import MLPProjector, QformerProjector
+from univam.models.scheduler import FlowMatchScheduler
 from univam.utils.data import check_tensor
 from univam.utils.overwatch import initialize_overwatch
 
@@ -27,31 +26,21 @@ from univam.utils.overwatch import initialize_overwatch
 overwatch = initialize_overwatch(__name__)
 
 
-def custom_sdpa(q, k, v):
-    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-    return out.transpose(1, 2)
-
-
-def get_mesh_id(f, h, w, f_w=1, f_shift=0, action=False):
-    f_idx = torch.arange(f_shift, f + f_shift) * f_w
-    h_idx = torch.arange(h)
-    w_idx = torch.arange(w)
-    ff, hh, ww = torch.meshgrid(f_idx, h_idx, w_idx, indexing="ij")
-
-    if action:
-        ff_offset = (torch.ones([h]).cumsum(0) / (h + 1)).view(1, -1, 1)
-        ff = ff + ff_offset
-        hh = torch.ones_like(hh) * -1
-        ww = torch.ones_like(ww) * -1
-
-    grid_id = torch.cat([ff.unsqueeze(0), hh.unsqueeze(0), ww.unsqueeze(0)], dim=0).flatten(1)
-    return grid_id
+def sample_timestep_id(
+    batch_size: int = 1,
+    min_timestep_bd: float = 0.0,
+    max_timestep_bd: float = 1.0,
+    num_train_timesteps: int = 1000,
+):
+    u = torch.rand(size=[batch_size])
+    u = u * (max_timestep_bd - min_timestep_bd) + min_timestep_bd
+    timestep_id = (u * num_train_timesteps).clamp(min=0, max=num_train_timesteps - 1).to(torch.int64)
+    return timestep_id
 
 
 def retrieve_timesteps(
     scheduler,
     num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
     timesteps: Optional[List[int]] = None,
     sigmas: Optional[List[float]] = None,
     **kwargs,
@@ -65,7 +54,7 @@ def retrieve_timesteps(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" timestep schedules. Please check whether you are using the correct scheduler."
             )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        scheduler.set_timesteps(timesteps=timesteps, **kwargs)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif sigmas is not None:
@@ -75,11 +64,11 @@ def retrieve_timesteps(
                 f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
                 f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+        scheduler.set_timesteps(sigmas=sigmas, **kwargs)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        scheduler.set_timesteps(num_inference_steps, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
@@ -237,214 +226,6 @@ class TimeVideoActionEmbedding(nn.Module):
         return temb, timestep_proj, encoder_hidden_states_video, encoder_hidden_states_action
 
 
-class WanRotaryPosEmbed(nn.Module):
-    def __init__(
-        self,
-        attention_head_dim: int,
-        patch_size: Tuple[int, int, int],
-        max_seq_len: int,
-        theta: float = 10000.0,
-    ):
-        super().__init__()
-
-        self.attention_head_dim = attention_head_dim
-        self.patch_size = patch_size
-        self.max_seq_len = max_seq_len
-        self.theta = theta
-
-        self.h_dim = self.attention_head_dim // 3
-        self.w_dim = self.attention_head_dim // 3
-        self.f_dim = self.attention_head_dim - self.h_dim - self.w_dim
-
-        # Precompute and register buffers
-        f_freqs_base, h_freqs_base, w_freqs_base = self._precompute_freqs_base()
-
-        self.register_buffer("f_freqs_base", f_freqs_base, persistent=False)
-        self.register_buffer("h_freqs_base", h_freqs_base, persistent=False)
-        self.register_buffer("w_freqs_base", w_freqs_base, persistent=False)
-
-    def _precompute_freqs_base(self):
-        # freqs_base = 1.0 / (theta ** (2k / dim))
-        f_freqs_base = 1.0 / (self.theta ** (torch.arange(0, self.f_dim, 2)[: (self.f_dim // 2)].double() / self.f_dim))
-        h_freqs_base = 1.0 / (self.theta ** (torch.arange(0, self.h_dim, 2)[: (self.h_dim // 2)].double() / self.h_dim))
-        w_freqs_base = 1.0 / (self.theta ** (torch.arange(0, self.w_dim, 2)[: (self.w_dim // 2)].double() / self.w_dim))
-        return f_freqs_base, h_freqs_base, w_freqs_base
-
-    def forward(self, grid_ids):
-        with torch.no_grad():
-            f_freqs = grid_ids[:, 0, :].unsqueeze(-1) * self.f_freqs_base
-            h_freqs = grid_ids[:, 1, :].unsqueeze(-1) * self.h_freqs_base
-            w_freqs = grid_ids[:, 2, :].unsqueeze(-1) * self.w_freqs_base
-            freqs = torch.cat([f_freqs, h_freqs, w_freqs], dim=-1).float()
-            freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_cis
-
-
-class WanAttention(torch.nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        heads: int = 8,
-        dim_head: int = 64,
-        eps: float = 1e-5,
-        dropout: float = 0.0,
-        cross_attention_dim_head: Optional[int] = None,
-        attn_mode: str = "sdpa",
-    ):
-        super().__init__()
-        if attn_mode == "sdpa":
-            self.attn_op = custom_sdpa
-        elif attn_mode == "flash_attention_2":
-            if torch.cuda.is_available():
-                self.attn_op = flash_attn_func
-            else:
-                self.attn_op = custom_sdpa
-                overwatch.warning("GPU not available. Fall back to `sdpa`")
-        else:
-            raise ValueError(f"Unsupported attention mode: {attn_mode}, only support torch and flashattn")
-
-        self.inner_dim = dim_head * heads
-        self.heads = heads
-        self.cross_attention_dim_head = cross_attention_dim_head
-        self.kv_inner_dim = self.inner_dim if cross_attention_dim_head is None else cross_attention_dim_head * heads
-
-        self.to_q = torch.nn.Linear(dim, self.inner_dim, bias=True)
-        self.to_k = torch.nn.Linear(dim, self.kv_inner_dim, bias=True)
-        self.to_v = torch.nn.Linear(dim, self.kv_inner_dim, bias=True)
-        self.to_out = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(self.inner_dim, dim, bias=True),
-                torch.nn.Dropout(dropout),
-            ]
-        )
-        self.norm_q = torch.nn.RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
-        self.norm_k = torch.nn.RMSNorm(dim_head * heads, eps=eps, elementwise_affine=True)
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        rotary_emb: Optional[torch.Tensor] = None,
-    ):
-        query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
-        query = self.norm_q(query)
-        query = query.unflatten(2, (self.heads, -1))
-        key = self.norm_k(key)
-        key = key.unflatten(2, (self.heads, -1))
-        value = value.unflatten(2, (self.heads, -1))
-
-        if rotary_emb is not None:
-
-            def apply_rotary_emb(x, freqs):
-                x_out = torch.view_as_complex(x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2))
-                x_out = torch.view_as_real(x_out * freqs).flatten(3)
-                return x_out.to(x.dtype)
-
-            query = apply_rotary_emb(query, rotary_emb)
-            key = apply_rotary_emb(key, rotary_emb)
-
-        hidden_states = self.attn_op(query, key, value)
-
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
-        hidden_states = self.to_out[0](hidden_states)
-        hidden_states = self.to_out[1](hidden_states)
-        return hidden_states
-
-
-class WanTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ffn_dim: int,
-        num_heads: int,
-        cross_attn_norm: bool = False,
-        eps: float = 1e-6,
-        attn_mode: str = "sdpa",
-    ):
-        super().__init__()
-        self.attn_mode = attn_mode
-
-        # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.attn1 = WanAttention(
-            dim=dim,
-            heads=num_heads,
-            dim_head=dim // num_heads,
-            eps=eps,
-            cross_attention_dim_head=None,
-            attn_mode=attn_mode,
-        )
-
-        # 2. Cross-attention
-        self.attn2 = WanAttention(
-            dim=dim,
-            heads=num_heads,
-            dim_head=dim // num_heads,
-            eps=eps,
-            cross_attention_dim_head=dim // num_heads,
-            attn_mode=attn_mode,
-        )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-
-        # 3. Feed-forward
-        self.ffn = FeedForward(dim, inner_dim=ffn_dim, activation_fn="gelu-approximate")
-        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        temb: torch.Tensor,
-        rotary_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = rearrange(
-            temb_scale_shift_table,
-            "b l n c -> b n l c",
-        ).chunk(6, dim=1)
-
-        shift_msa = shift_msa.squeeze(1)
-        scale_msa = scale_msa.squeeze(1)
-        gate_msa = gate_msa.squeeze(1)
-        c_shift_msa = c_shift_msa.squeeze(1)
-        c_scale_msa = c_scale_msa.squeeze(1)
-        c_gate_msa = c_gate_msa.squeeze(1)
-
-        # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1.0 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(
-            norm_hidden_states,
-            norm_hidden_states,
-            norm_hidden_states,
-            rotary_emb,
-        )
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
-
-        # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(
-            norm_hidden_states,
-            encoder_hidden_states,
-            encoder_hidden_states,
-            None,
-        )
-        hidden_states = hidden_states + attn_output
-
-        # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1.0 + c_scale_msa) + c_shift_msa).type_as(
-            hidden_states
-        )
-
-        ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
-
-        return hidden_states
-
-
 class WanTransformer3DModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
@@ -454,15 +235,16 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         attention_head_dim: int = 128,
         in_channels: int = 48,
         out_channels: int = 48,
-        video_dim: int = 4096,
+        video_dim: int = 2048,
         action_dim: Optional[int] = None,
         freq_dim: int = 256,
         ffn_dim: int = 14336,
         num_layers: int = 30,
         cross_attn_norm: bool = True,
+        qk_norm: Optional[str] = "rms_norm_across_heads",
         eps: float = 1e-6,
+        added_kv_proj_dim: Optional[int] = None,
         rope_max_seq_len=1024,
-        attn_mode: str = "sdpa",
     ):
         super().__init__()
 
@@ -474,7 +256,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
-        # self.patch_embedding_mlp = nn.Linear(in_channels * patch_size[0] * patch_size[1] * patch_size[2], inner_dim)
 
         # 2. Condition embeddings
         self.condition_embedder = TimeVideoActionEmbedding(
@@ -488,7 +269,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, cross_attn_norm, eps, attn_mode=attn_mode)
+                WanTransformerBlock(
+                    inner_dim, ffn_dim, num_attention_heads, qk_norm, cross_attn_norm, eps, added_kv_proj_dim
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -507,7 +290,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
     def forward(
         self,
-        grid_id: torch.Tensor,
         timestep: torch.Tensor,
         # TODO deside to cat action tokens or not
         hidden_states_video: torch.Tensor,
@@ -516,6 +298,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states_action: Optional[torch.Tensor] = None,
     ):
         B, C, T, H, W = hidden_states_video.shape
+
+        p_t, p_h, p_w = self.patch_size
+        post_patch_num_frames = T // p_t
+        post_patch_height = H // p_h
+        post_patch_width = W // p_w
+
+        rotary_emb = self.rope(hidden_states_video)
 
         hidden_states_video = self.patch_embedding(hidden_states_video)
         hidden_states = hidden_states_video.flatten(2).transpose(1, 2)
@@ -530,7 +319,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             hidden_states = torch.cat([hidden_states, hidden_states_action], dim=1)
             action_token_nums = hidden_states_action[1]
 
-        rotary_emb = self.rope(grid_id)[:, :, None]  # [B, tokens, 1, (H//p2)*(W//p3)]
+        # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
+        if timestep.ndim == 2:
+            ts_seq_len = timestep.shape[1]
+            timestep = timestep.flatten()  # batch_size * seq_len
+        else:
+            ts_seq_len = None
 
         temb, timestep_proj, encoder_hidden_states_video, encoder_hidden_states_action = self.condition_embedder(
             timestep=timestep,
@@ -538,22 +332,38 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             encoder_hidden_states_action=encoder_hidden_states_action,
         )
 
-        timestep_proj = timestep_proj[:, None, :]  # [B, 1, 6*inner_dim]
-        timestep_proj = timestep_proj.expand(-1, hidden_states.shape[1], -1)  # [B, tokens, 6*inner_dim]
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        if ts_seq_len is not None:
+            # batch_size, seq_len, 6, inner_dim
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        else:
+            # batch_size, 6, inner_dim
+            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+
+        if encoder_hidden_states_action is not None:
+            encoder_hidden_states = torch.concat([encoder_hidden_states_action, encoder_hidden_states_video], dim=1)
+        else:
+            encoder_hidden_states = encoder_hidden_states_video
 
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
-                encoder_hidden_states_video,
+                encoder_hidden_states,
                 timestep_proj,
                 rotary_emb,
             )
 
-        temb_scale_shift_table = self.scale_shift_table + temb[:, None, :]
-        shift, scale = temb_scale_shift_table.chunk(2, dim=1)
+        if temb.ndim == 3:
+            # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
+            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            # batch_size, inner_dim
+            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
+
         hidden_states = (self.norm_out(hidden_states.float()) * (1.0 + scale) + shift).type_as(hidden_states)
 
         if hidden_states_action is not None:
@@ -572,12 +382,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             hidden_states_video = rearrange(
                 hidden_states_video,
                 "b (t h w) (c p1 p2 p3) -> b c (t p1) (h p2) (w p3)",
-                t=T // self.patch_size[0],
-                h=H // self.patch_size[1],
-                w=W // self.patch_size[2],
-                p1=self.patch_size[0],
-                p2=self.patch_size[1],
-                p3=self.patch_size[2],
+                t=post_patch_num_frames,
+                h=post_patch_height,
+                w=post_patch_width,
+                p1=p_t,
+                p2=p_h,
+                p3=p_w,
             )
 
         return hidden_states_video, hidden_states_action
@@ -623,7 +433,6 @@ class Wan22VisionActionModel(nn.Module):
             subfolder="transformer",
             patch_size=config.wanva.patch_size,
             num_attention_heads=config.wanva.num_attention_heads,
-            attn_mode=config.wanva.attn_mode,
             low_cpu_mem_usage=False,
             ignore_mismatched_sizes=True,
         )
@@ -646,15 +455,24 @@ class Wan22VisionActionModel(nn.Module):
 
         self.num_channels_latents = self.transformer3d.config.in_channels
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(config.wanva.model_path, subfolder="scheduler")
-
-        self.eval_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            config.wanva.model_path, subfolder="scheduler"
-        )
-
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
         self.num_inference_steps = getattr(config.wanva, "num_inference_steps", 50)
+
+        self.scheduler = FlowMatchScheduler(
+            shift=5.0,
+            sigma_min=0.0,
+            extra_one_step=True,
+            num_train_timesteps=1000,
+        )
+        self.scheduler.set_timesteps(num_inference_steps=1000, training=True)
+
+        self.eval_scheduler = FlowMatchScheduler(
+            shift=5.0,
+            sigma_min=0.0,
+            extra_one_step=True,
+            num_inference_steps=config.wanva.num_inference_steps,
+        )
 
         self.token_dropout = getattr(config.wanva, "token_dropout", False)
         self.num_token = config.projector.num_token
@@ -752,24 +570,6 @@ class Wan22VisionActionModel(nn.Module):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def _make_grid_id(self, latents, dtype, action=False):
-        f = latents.shape[-3] // self.transformer3d.patch_size[0]
-        h = latents.shape[-2] // self.transformer3d.patch_size[1]
-        w = latents.shape[-1] // self.transformer3d.patch_size[2]
-
-        grid_id = get_mesh_id(
-            f=f,
-            h=h,
-            w=w,
-            f_w=1,
-            f_shift=0,
-            action=action,
-        ).unsqueeze(0)
-
-        # assume videos are same shape
-        grid_id = torch.cat([grid_id] * latents.shape[0], dim=0).to(device=latents.device, dtype=dtype)
-        return grid_id
-
     def encode(self, videos: torch.Tensor, do_classifier_free_guidance: bool = False):
         dtype = next(self.projector.parameters()).dtype
         videos = videos.to(device=self.device, dtype=dtype)
@@ -807,21 +607,21 @@ class Wan22VisionActionModel(nn.Module):
 
         video_noise = torch.randn_like(video_latents, dtype=self.dtype)
 
-        timestep_id = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,))
+        timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,))
+
+        timestep_id = sample_timestep_id(
+            batch_size=videos.shape[0],
+            num_train_timesteps=self.scheduler.num_train_timesteps,
+        )
         timesteps = self.scheduler.timesteps[timestep_id].to(dtype=self.dtype, device=self.device)
 
-        sigmas = self.scheduler.sigmas[timestep_id].to(dtype=self.dtype, device=self.device)
-        sigmas = sigmas.view(batch_size, 1, 1, 1, 1)
-        video_noisy_latents = (1.0 - sigmas) * video_latents + sigmas * video_noise
+        video_noisy_latents = self.scheduler.add_noise(video_latents, video_noise, timesteps)
         video_noisy_latents[:, 0:1, :, :, :] = first_frame_latents
 
-        # Flow-Matching target
-        target = video_noise - video_latents
+        target = self.scheduler.training_target(video_latents, video_noise, timesteps)
         target[:, 0:1, :, :, :] = 0
 
-        grid_ids = self._make_grid_id(video_noisy_latents, dtype=video_noisy_latents.dtype)
         model_pred_video_latents, _ = self.transformer3d(
-            grid_id=grid_ids,
             timestep=timesteps,
             hidden_states_video=video_noisy_latents,
             encoder_hidden_states_video=video_embeds,
@@ -829,7 +629,10 @@ class Wan22VisionActionModel(nn.Module):
         check_tensor(model_pred_video_latents, "model_pred_video_latents", check_bound=100, check_std=10)
         model_pred_video_latents[:, 0:1, :, :, :] = 0
 
-        loss = torch.nn.functional.mse_loss(model_pred_video_latents, target, reduction="mean")
+        loss = torch.nn.functional.mse_loss(model_pred_video_latents, target, reduction="none")
+        loss = loss.view(loss.shape[0], -1).mean(dim=1)
+        loss = loss * self.scheduler.training_weight(timesteps)
+        loss = loss.mean()
 
         outputs["loss"] = loss
         return outputs
@@ -845,11 +648,10 @@ class Wan22VisionActionModel(nn.Module):
         timesteps, num_inference_steps = retrieve_timesteps(
             scheduler=self.eval_scheduler,
             num_inference_steps=self.num_inference_steps,
-            device=self.device,
             timesteps=None,
         )
 
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.eval_scheduler.order, 0)
+        timesteps = timesteps.to(self.device)
 
         latents = self.prepare_latents(
             batch_size=videos.shape[0],
@@ -864,16 +666,12 @@ class Wan22VisionActionModel(nn.Module):
 
         latents[:, :, 0:1, :, :] = first_frame_latents
 
-        grid_ids = self._make_grid_id(latents, dtype=latents.dtype)
-
         with self.progress_bar(total=num_inference_steps, use_tqdm=use_tqdm) as progress_bar:
-            for i, t in enumerate(timesteps):
+            for t in timesteps:
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                grid_model_input = torch.cat([grid_ids] * 2) if do_classifier_free_guidance else grid_ids
 
                 timestep = t.expand(latent_model_input.shape[0])
                 noise_pred_video, _ = self.transformer3d(
-                    grid_id=grid_model_input,
                     timestep=timestep,
                     hidden_states_video=latent_model_input,
                     encoder_hidden_states_video=video_embeds,
@@ -883,10 +681,11 @@ class Wan22VisionActionModel(nn.Module):
                     noise_pred_uncond, noise_pred_text = noise_pred_video.chunk(2)
                     noise_pred_video = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                latents = self.eval_scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
+                noise_pred_video[:, :, 0:1, :, :] = 0
+                latents = self.eval_scheduler.step(noise_pred_video, t, latents)
+                latents[:, :, 0:1, :, :] = first_frame_latents
 
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.eval_scheduler.order == 0):
-                    progress_bar.update()
+                progress_bar.update()
 
         latents = latents.to(dtype=self.dtype)
         gen_videos = self.vavae.decode(latents)
@@ -941,7 +740,6 @@ def test_transformer3d(args, video_latents, device, dtype):
         patch_size=args.wanva.patch_size,
         num_attention_heads=args.wanva.num_attention_heads,
         video_tokens=args.projector.num_token,
-        attn_mode=args.wanva.attn_mode,
         low_cpu_mem_usage=False,
         ignore_mismatched_sizes=True,
     )
@@ -964,16 +762,6 @@ def test_transformer3d(args, video_latents, device, dtype):
 
     transformer3d = transformer3d.to(device=device, dtype=dtype)
 
-    grid_id = get_mesh_id(
-        f=video_latents.shape[-3] // args.wanva.patch_size[0],
-        h=video_latents.shape[-2] // args.wanva.patch_size[1],
-        w=video_latents.shape[-1] // args.wanva.patch_size[2],
-        f_w=1,
-        f_shift=0,
-        action=False,
-    ).unsqueeze(0)
-    grid_id = torch.cat([grid_id] * batch_size, dim=0).to(device=device, dtype=dtype)
-
     timestep = torch.ones((batch_size), dtype=torch.float32, device=device) * 0
 
     encoder_hidden_states_video = torch.randn(
@@ -981,7 +769,6 @@ def test_transformer3d(args, video_latents, device, dtype):
     )
 
     hidden_states_video, _ = transformer3d(
-        grid_id=grid_id,
         timestep=timestep,
         hidden_states_video=video_latents,
         encoder_hidden_states_video=encoder_hidden_states_video,
@@ -1027,9 +814,9 @@ if __name__ == "__main__":
     train_flops = FlopCountAnalysis(model, videos).total()
 
     # eval part
-    # model.eval()
-    # eval_outputs = model(videos)
-    # eval_flops = FlopCountAnalysis(model, videos).total()
+    model.eval()
+    eval_outputs = model(videos)
+    eval_flops = FlopCountAnalysis(model, videos).total()
 
     print(">>>>> general part <<<<<")
     print(f"Total params: {total_params / 1e6:.2f} M")
@@ -1039,7 +826,7 @@ if __name__ == "__main__":
     print(f"FLOPs: {train_flops / 1e9:.2f} GFLOPs")
     print(f"Loss: {train_outputs['loss']}")
 
-    # print(">>>>> eval part <<<<<")
-    # print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
-    # print(f"Output shape: {eval_outputs['videos'].shape}")
+    print(">>>>> eval part <<<<<")
+    print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
+    print(f"Output shape: {eval_outputs['videos'].shape}")
     # >>> end main test for Wan22VisionActionModel <<<

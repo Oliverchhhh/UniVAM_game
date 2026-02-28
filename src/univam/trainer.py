@@ -233,43 +233,43 @@ class Trainer:
                     self.global_step += 1
                     train_pbar.update(1)
 
-                if self.global_step % 10 == 0:
-                    current_time = time.time()
-                    elapsed = current_time - last_log_time
-                    avg_time_per_step = elapsed / 10.0 if self.global_step > 0 else 0
+                    if self.global_step % 10 == 0:
+                        current_time = time.time()
+                        elapsed = current_time - last_log_time
+                        avg_time_per_step = elapsed / 10.0 if self.global_step > 0 else 0
 
-                    current_lr = self.lr_scheduler.get_lr()
-                    if isinstance(current_lr, list):
-                        current_lr = current_lr[0]
+                        current_lr = self.lr_scheduler.get_lr()
+                        if isinstance(current_lr, list):
+                            current_lr = current_lr[0]
 
-                    if overwatch.is_rank_zero():
-                        overwatch.info(
-                            f"Step: {self.global_step}/{self.num_iters} | "
-                            f"Loss: {loss_to_log:.4f} | "
-                            f"LR: {current_lr:.2e} | "
-                            f"Time/Step: {avg_time_per_step:.4f}s"
-                        )
+                        if overwatch.is_rank_zero():
+                            overwatch.info(
+                                f"Step: {self.global_step}/{self.num_iters} | "
+                                f"Loss: {loss_to_log:.4f} | "
+                                f"LR: {current_lr:.2e} | "
+                                f"Time/Step: {avg_time_per_step:.4f}s"
+                            )
 
-                    last_log_time = current_time
+                        last_log_time = current_time
 
-                if self.global_step % self.save_step == 0 and self.global_step != 0:
-                    overwatch.warning("Saving model...")
-                    self.save_checkpoint()
+                    if self.global_step % self.save_step == 0 and self.global_step != 0:
+                        overwatch.warning("Saving model...")
+                        self.save_checkpoint()
 
-                if self.global_step % self.eval_step == 0 and self.global_step != 0:
-                    overwatch.warning("Evaluating...")
-                    if eval_loader:
-                        # sample a single round training sample to test whether over-fitting
-                        eval_meter, eval_time = self.eval_fn(eval_loader, use_tqdm=use_tqdm)
-                        overwatch.info(
-                            f"[Rank {self.rank}] Valid Step: {self.global_step}, Time: {eval_time}\n{eval_meter.avg}"
-                        )
-                    torch.cuda.empty_cache()
+                    if self.global_step % self.eval_step == 0 and self.global_step != 0:
+                        overwatch.warning("Evaluating...")
+                        if eval_loader:
+                            # sample a single round training sample to test whether over-fitting
+                            eval_meter, eval_time = self.eval_fn(eval_loader, use_tqdm=use_tqdm)
+                            overwatch.info(
+                                f"[Rank {self.rank}] Valid Step: {self.global_step}, Time: {eval_time}\n{eval_meter.avg}"
+                            )
+                        torch.cuda.empty_cache()
 
-                    # Update metric with eval metrics
-                    train_meter = Meter()
+                        # Update metric with eval metrics
+                        train_meter = Meter()
 
-                    last_log_time = time.time()
+                        last_log_time = time.time()
 
             if self.global_step >= self.num_iters:
                 break

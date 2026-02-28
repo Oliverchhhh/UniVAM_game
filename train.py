@@ -84,7 +84,7 @@ def main(args):
 
         scheduler = WarmupLinearConstantLR(
             optimizer,
-            max_iter=(args.train.num_iters // args.train.gradient_accumulate_steps) + 1,
+            max_iter=args.train.num_iters + 1,
             warmup_ratio=getattr(args, "warmup_ratio", 0.01),
         )
 

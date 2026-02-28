@@ -12,9 +12,9 @@ projector:
   num_token: 8
   num_attn_layers: 6
   num_attn_compress_layers: 6
-  hidden_dim: 4096
-  output_align_dim: 4096
-  cross_attention_dim: 2048
+  hidden_dim: 2048
+  output_align_dim: 2048
+  cross_attention_dim: 1024
 
 wanva:
   token_dropout: False
@@ -22,7 +22,6 @@ wanva:
   num_inference_steps: 50
   patch_size: [1, 2, 2]
   num_attention_heads: 24
-  attn_mode: ${oc.env:ATTN_MODE} # sdpa | flash_attention_2
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
