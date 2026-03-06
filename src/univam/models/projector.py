@@ -218,9 +218,11 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
 
-    video_pooler_feature = (
-        torch.randn(video_feature_extractor.patches, video_feature_extractor.out_hidden_size).unsqueeze(0).to(device)
-    )
+    batch_size = 2
+
+    video_pooler_feature = torch.randn(
+        batch_size, video_feature_extractor.patches, video_feature_extractor.out_hidden_size
+    ).to(device)
 
     compressed_embeds = model(video_pooler_feature)
 

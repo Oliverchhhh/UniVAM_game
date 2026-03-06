@@ -3,7 +3,7 @@ k ?= 1
 
 .PHONY: quality style clean
 
-check_dirs := src train.py
+check_dirs := src train.py download_models.py
 exclude_dirs := tests
 
 quality:

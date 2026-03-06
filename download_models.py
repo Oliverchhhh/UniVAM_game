@@ -1,6 +1,10 @@
-from modelscope import snapshot_download
-from dotenv import load_dotenv
 import os
+
+from dotenv import load_dotenv
+from modelscope import snapshot_download
+
+from univam.models.deepstack import convert_qwen3vl_to_vfe_ckpt
+from univam.utils.files import ensure_directory
 
 
 load_dotenv()
@@ -11,7 +15,16 @@ snapshot_download(
     cache_dir=cache_dir,
 )
 
-snapshot_download(
+qwen_vl = snapshot_download(
     "Qwen/Qwen3-VL-8B-Instruct",
-    cache_dir=cache_dir
+    cache_dir=cache_dir,
+)
+
+vfe_path = os.path.join(cache_dir, "Qwen/Qwen3-VL-VideoFeatureExtractor/Qwen3-VL-VideoFeatureExtractor-8b.pt")
+
+ensure_directory(os.path.basename(vfe_path))
+
+convert_qwen3vl_to_vfe_ckpt(
+    qwen_vl,
+    vfe_path,
 )

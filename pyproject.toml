@@ -31,7 +31,9 @@ dependencies = [
     "ruff",
     "imageio[ffmpeg]",
     "matplotlib",
-    "fvcore"
+    "fvcore",
+    "pandas",
+    "pyarrow"
 ]
 
 [tool.setuptools]
