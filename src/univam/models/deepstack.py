@@ -342,7 +342,7 @@ if __name__ == "__main__":
     args = load_args()
 
     # To infer on a GPU, you can set `_attn_implementation` with "flash_attention_2", which only support fp16 and bf16 data type
-    device = torch.device("npu" if torch.npu.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     batch_size = 2

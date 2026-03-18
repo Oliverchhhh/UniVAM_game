@@ -12,7 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from univam.models.wanva import Wan22VisionActionModel
-from univam.utils.data import check_tensor, fp32_to_bf16, move_to_npu
+from univam.utils.data import check_tensor, fp32_to_bf16, move_to_cuda
 from univam.utils.files import ensure_directory, ensure_dirname
 from univam.utils.metrics import Meter, Timer, calculate_psnr, calculate_ssim, get_parameters
 from univam.utils.overwatch import initialize_overwatch
@@ -29,7 +29,7 @@ class Trainer:
 
         self.local_rank = overwatch.local_rank()
         self.rank = overwatch.rank()
-        self.device = torch.device("npu") if torch.npu.is_available() else torch.device("cpu")
+        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
         self.epoch = -1
         self.global_step = -1
@@ -102,7 +102,7 @@ class Trainer:
             loss.backward()
 
     def prepare_batch(self, batch) -> Dict[str, Any]:
-        batch = move_to_npu(batch)
+        batch = move_to_cuda(batch)
         batch = fp32_to_bf16(batch)
         return batch
 
@@ -256,7 +256,7 @@ class Trainer:
                             overwatch.info(
                                 f"[Rank {self.rank}] Valid Step: {self.global_step}, Time: {eval_time}\n{eval_meter.avg}"
                             )
-                        torch.npu.empty_cache()
+                        torch.cuda.empty_cache()
 
                         # Update metric with eval metrics
                         train_meter = Meter()

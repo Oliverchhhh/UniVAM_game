@@ -24,8 +24,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.npu.is_available():
-        torch.npu.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -65,17 +65,17 @@ def fp32_to_bf16(batch):
     return new_batch
 
 
-def move_to_npu(batch):
-    if not torch.npu.is_available():
+def move_to_cuda(batch):
+    if not torch.cuda.is_available():
         return batch
     if isinstance(batch, torch.Tensor):
-        return batch.npu(non_blocking=True)
+        return batch.cuda(non_blocking=True)
     elif isinstance(batch, list):
-        new_batch = [move_to_npu(t) for t in batch]
+        new_batch = [move_to_cuda(t) for t in batch]
     elif isinstance(batch, tuple):
-        new_batch = tuple(move_to_npu(t) for t in batch)
+        new_batch = tuple(move_to_cuda(t) for t in batch)
     elif isinstance(batch, dict):
-        new_batch = {n: move_to_npu(t) for n, t in batch.items()}
+        new_batch = {n: move_to_cuda(t) for n, t in batch.items()}
     else:
         return batch
     return new_batch

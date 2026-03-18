@@ -14,7 +14,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "numpy>1.23.5,<2",
-    "torch-npu==2.8.0",
+    "torch==2.8.0",
     "torchvision==0.23.0",
     "accelerate==1.12.0",
     "deepspeed==0.18.2",
@@ -38,7 +38,8 @@ dependencies = [
     "opencv-python",
     "decorator",
     "scipy",
-    "setuptools<82"
+    "setuptools<82",
+    "decord"
 ]
 
 [tool.setuptools]

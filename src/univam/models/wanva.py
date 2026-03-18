@@ -675,8 +675,8 @@ if __name__ == "__main__":
     args = load_args()
     set_seed(args.seed)
 
-    device = torch.device("npu" if torch.npu.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.npu.is_available() else torch.float32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     batch_size = 2
 

@@ -1,7 +1,7 @@
 export HF_ENDPOINT=https://hf-mirror.com
 
 DATASET_ID="Facebear/XVLA-Soft-Fold"
-DATASETS_PATH="./datasets"
+DATASETS_PATH="./"
 
 THREADS=10
 
