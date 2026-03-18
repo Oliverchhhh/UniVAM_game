@@ -26,7 +26,7 @@ def main(args):
         train_dataloader = load_multi_datasets_form_json(
             args.data,
             json_path=args.data.train_json_path,
-            flip_p=0.5,
+            flip_p=0,
             local_batch_size=args.train.local_batch_size,
             num_workers=args.data.num_workers,
             is_infinite=True,
@@ -58,11 +58,11 @@ def main(args):
         optimizer_grouped_parameters = [
             {
                 "params": model.projector.parameters(),
-                "lr": args.train.learning_rate * 10,
+                "lr": args.train.learning_rate * 1,
             },
             {
                 "params": model.transformer3d.condition_embedder.parameters(),
-                "lr": args.train.learning_rate * 10,
+                "lr": args.train.learning_rate * 1,
             },
             {
                 "params": [
@@ -85,7 +85,7 @@ def main(args):
         scheduler = WarmupLinearConstantLR(
             optimizer,
             max_iter=args.train.num_iters + 1,
-            warmup_ratio=getattr(args, "warmup_ratio", 0.01),
+            warmup_ratio=args.train.warmup_ratio,
         )
 
         trainer = Trainer(args, model, optimizer, scheduler)

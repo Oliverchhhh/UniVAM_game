@@ -66,8 +66,7 @@ def calculate_rfid(pred, target, device="cpu"):
     pred, target: [B, T, C, H, W], 取值范围 [0,1]
     计算 video 重建的 FID
     """
-
-    assert pred.shape == target.shape
+    assert pred.shape == target.shape, f"pred.shape: {pred.shape}, target.shape: {target.shape}"
     B, T, C, H, W = pred.shape
 
     # 展平成图像 batch
@@ -101,8 +100,7 @@ def calculate_psnr(pred, target, max_val=1.0):
     """
     pred, target: [B, T, C, H, W]
     """
-
-    assert pred.shape == target.shape
+    assert pred.shape == target.shape, f"pred.shape: {pred.shape}, target.shape: {target.shape}"
     pred = pred.to(torch.float32)
     target = target.to(torch.float32)
 
@@ -118,8 +116,7 @@ def calculate_ssim(pred, target, max_val=1.0, window_size=11, K1=0.01, K2=0.03):
     """
     pred, target: [B, T, C, H, W]
     """
-
-    assert pred.shape == target.shape
+    assert pred.shape == target.shape, f"pred.shape: {pred.shape}, target.shape: {target.shape}"
     B, T, C, H, W = pred.shape
 
     # 展平成图像 batch

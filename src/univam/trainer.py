@@ -7,11 +7,12 @@ import torch
 import torch.distributed as DIST
 import torchvision.transforms as T
 from accelerate import Accelerator
+from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
 from univam.models.wanva import Wan22VisionActionModel
-from univam.utils.data import check_tensor, complex_to_device, fp32_to_bf16, move_to_cuda
+from univam.utils.data import check_tensor, fp32_to_bf16, move_to_npu
 from univam.utils.files import ensure_directory, ensure_dirname
 from univam.utils.metrics import Meter, Timer, calculate_psnr, calculate_ssim, get_parameters
 from univam.utils.overwatch import initialize_overwatch
@@ -28,7 +29,7 @@ class Trainer:
 
         self.local_rank = overwatch.local_rank()
         self.rank = overwatch.rank()
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device("npu") if torch.npu.is_available() else torch.device("cpu")
 
         self.epoch = -1
         self.global_step = -1
@@ -45,29 +46,22 @@ class Trainer:
         self.save_step = args.train.save_step
         self.local_batch_size = args.train.local_batch_size
         self.gradient_accumulate_steps = args.train.gradient_accumulate_steps
-        self.max_grad_norm = args.train.max_grad_norm
         self.iter_per_ep = None
 
         self.seed = args.seed
         self.task_name = args.task_name
         self.fps = args.data.fps
         self.image_size = args.data.image_size
-        self.log_dir = os.path.join(args.log_dir, args.task_name, args.projector.type)
-        self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name, args.projector.type)
+        self.log_dir = os.path.join(args.log_dir, args.task_name)
+        self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name)
 
         if overwatch.is_rank_zero() and args.do_train:
             ensure_directory(self.log_dir)
+            ensure_directory(self.ckpt_save_dir)
 
-    def move_model_to_cuda(self) -> None:
-        self.model.to(self.device)
-        if self.optimizer is not None:
-            if isinstance(self.optimizer, list):
-                for i in range(len(self.optimizer)):
-                    self.optimizer[i].load_state_dict(
-                        complex_to_device(self.optimizer[i].state_dict(), device=self.device)
-                    )
-            else:
-                self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
+        OmegaConf.resolve(args)
+        if overwatch.is_rank_zero():
+            OmegaConf.save(args, os.path.join(self.ckpt_save_dir, "config.yaml"))
 
     def prepare_dist_model(self) -> None:
         self.accelerator = Accelerator(
@@ -108,7 +102,7 @@ class Trainer:
             loss.backward()
 
     def prepare_batch(self, batch) -> Dict[str, Any]:
-        batch = move_to_cuda(batch)
+        batch = move_to_npu(batch)
         batch = fp32_to_bf16(batch)
         return batch
 
@@ -116,8 +110,6 @@ class Trainer:
         if hasattr(self, "accelerator") and self.accelerator is not None:
             if not self.accelerator.sync_gradients:
                 return
-
-        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
         if optimizer_idx >= 0 and isinstance(self.optimizer, list):
             optimizer = self.optimizer[optimizer_idx]
@@ -264,7 +256,7 @@ class Trainer:
                             overwatch.info(
                                 f"[Rank {self.rank}] Valid Step: {self.global_step}, Time: {eval_time}\n{eval_meter.avg}"
                             )
-                        torch.cuda.empty_cache()
+                        torch.npu.empty_cache()
 
                         # Update metric with eval metrics
                         train_meter = Meter()

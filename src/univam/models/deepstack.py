@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionAttention,
@@ -258,13 +257,11 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
         ckpt = torch.load(config.model_path, map_location="cpu")
         self.vision_model.load_state_dict(ckpt, strict=False)
 
-        self.frames = frames
-
         self.patch_size = config.patch_size
         self.merge_size = config.spatial_merge_size
         self.temporal_patch_size = config.temporal_patch_size
 
-        if (frames - 1) % self.temporal_patch_size != 0:
+        if frames % self.temporal_patch_size != 0:
             raise ValueError(
                 f"`frames` ({frames}) must be divisible by `temporal_patch_size` ({self.temporal_patch_size})."
             )
@@ -291,26 +288,32 @@ class Qwen3VLVideoFeatureExtractor(nn.Module):
     def preprocess(self, videos: torch.Tensor):
         B, T, C, H, W = videos.shape
 
-        if T == self.frames:
-            videos = videos[:, 1:, :, :, :]
-
-        videos = videos.view(
+        videos = videos.reshape(
             B,
             self.grid_t,
             self.temporal_patch_size,
             C,
-            self.grid_h // self.merge_size,
-            self.merge_size,
+            self.grid_h,
             self.patch_size,
-            self.grid_w // self.merge_size,
-            self.merge_size,
+            self.grid_w,
             self.patch_size,
         )
 
-        videos = rearrange(
-            videos,
-            "b gt tpt c gh msh ph gw msw pw -> b (gt gh gw msh msw) (c tpt ph pw)",
-        )
+        B, gt, tpt, C, H_comb, ph, W_comb, pw = videos.shape
+
+        videos = videos.reshape(B, gt, tpt, C * ph * pw, H_comb, W_comb)
+
+        gh = self.grid_h // self.merge_size
+        msh = self.merge_size
+        gw = self.grid_w // self.merge_size
+        msw = self.merge_size
+        videos = videos.reshape(B, gt, tpt, C * ph * pw, gh, msh, gw, msw)
+
+        videos = videos.permute(0, 1, 4, 6, 5, 7, 2, 3)
+
+        videos = videos.reshape(B, gt * gh * gw * msh * msw, tpt, C * ph * pw)
+
+        videos = videos.reshape(B, gt * gh * gw * msh * msw, C * tpt * ph * pw)
 
         video_grid_thw = torch.tensor([[self.grid_t, self.grid_h, self.grid_w]] * B, dtype=torch.int32)
         return videos, video_grid_thw
@@ -339,7 +342,7 @@ if __name__ == "__main__":
     args = load_args()
 
     # To infer on a GPU, you can set `_attn_implementation` with "flash_attention_2", which only support fp16 and bf16 data type
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("npu" if torch.npu.is_available() else "cpu")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     batch_size = 2
@@ -353,7 +356,7 @@ if __name__ == "__main__":
     # get real data via Dataset
     data = VideoData(args.data)
     data.video_paths = ["tests/examples/video_24fps_256x256.mp4"]
-    video = data.read_video_torchcodec(0, 0)
+    video = data.read_video_decord(0, 0)
     video = video.unsqueeze(0)
     videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
 

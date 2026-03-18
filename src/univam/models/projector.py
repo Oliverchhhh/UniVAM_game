@@ -194,7 +194,7 @@ if __name__ == "__main__":
 
     args = load_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("npu" if torch.npu.is_available() else "cpu")
 
     video_feature_extractor = Qwen3VLVideoFeatureExtractor(
         args.video_feature_extractor,

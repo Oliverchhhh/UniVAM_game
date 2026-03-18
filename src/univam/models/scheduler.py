@@ -119,11 +119,10 @@ class FlowMatchScheduler:
         model_output = (sample - sample_stablized) / sigma
         return model_output
 
-    def add_noise(self, original_samples, noise, timestep):
+    def add_noise(self, original_samples, noise, timestep, timestep_id):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps[:, None] - timestep).abs(), dim=0)
-        sigma = self.sigmas[timestep_id].to(original_samples).view(original_samples.shape[0], 1, 1, 1, 1)
+        sigma = self.sigmas[timestep_id].to(noise).view(noise.shape[0], 1, 1, 1, 1)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 
@@ -131,10 +130,17 @@ class FlowMatchScheduler:
         target = noise - sample
         return target
 
-    def training_weight(self, timestep):
-        timestep_id = torch.argmin((self.timesteps[:, None].to(timestep.device) - timestep).abs(), dim=0)
+    def training_weight(self, timestep, timestep_id):
         weights = self.linear_timesteps_weights.to(timestep.device)[timestep_id].to(timestep.device)
         return weights
+
+    def calculate_loss(self, pred, target, timestep, timestep_id):
+        weights = self.training_weight(timestep, timestep_id)
+        loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        loss = loss.reshape(loss.shape[0], -1).mean(dim=1)
+        loss = loss * weights
+        loss = loss.mean()
+        return loss
 
     def calculate_shift(
         self,

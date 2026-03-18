@@ -3,13 +3,13 @@ import math
 import os
 import random
 
+import decord
 import jsonlines
 import numpy as np
 import torch
 import torch.distributed as dist
 from PIL.Image import Resampling
 from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
-from torchcodec.decoders import VideoDecoder
 from torchvision.transforms import functional as F
 
 from univam.utils.overwatch import initialize_overwatch
@@ -24,8 +24,8 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if torch.npu.is_available():
+        torch.npu.manual_seed_all(seed)
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -33,23 +33,6 @@ def set_seed(seed: int):
         torch.use_deterministic_algorithms(True)
     except Exception:
         pass
-
-
-def complex_to_device(complex, device, non_blocking=False):
-    if complex is None:
-        return complex
-    if isinstance(complex, torch.Tensor):
-        return complex.to(device, non_blocking=non_blocking)
-    elif isinstance(complex, dict):
-        return {k: complex_to_device(v, device, non_blocking=non_blocking) for k, v in complex.items()}
-    elif isinstance(complex, list) or isinstance(complex, tuple):
-        return [complex_to_device(e, device, non_blocking=non_blocking) for e in complex]
-    elif (
-        isinstance(complex, str) or isinstance(complex, bytes) or isinstance(complex, int) or isinstance(complex, float)
-    ):
-        return complex
-    else:
-        raise ValueError("Unsupported complex", complex)
 
 
 def fp32_to_fp16(batch):
@@ -82,17 +65,17 @@ def fp32_to_bf16(batch):
     return new_batch
 
 
-def move_to_cuda(batch):
-    if not torch.cuda.is_available():
+def move_to_npu(batch):
+    if not torch.npu.is_available():
         return batch
     if isinstance(batch, torch.Tensor):
-        return batch.cuda(non_blocking=True)
+        return batch.npu(non_blocking=True)
     elif isinstance(batch, list):
-        new_batch = [move_to_cuda(t) for t in batch]
+        new_batch = [move_to_npu(t) for t in batch]
     elif isinstance(batch, tuple):
-        new_batch = tuple(move_to_cuda(t) for t in batch)
+        new_batch = tuple(move_to_npu(t) for t in batch)
     elif isinstance(batch, dict):
-        new_batch = {n: move_to_cuda(t) for n, t in batch.items()}
+        new_batch = {n: move_to_npu(t) for n, t in batch.items()}
     else:
         return batch
     return new_batch
@@ -199,26 +182,23 @@ def get_loader_info(dataset_len, epochs, bsz, gradient_accumulate_steps):
 
 
 class ResampledVideoDecoder:
-    """
-    A wrapper over VideoDecoder that provides temporal resampling
-    to a target fps using strict linear time mapping.
-    """
-
-    def __init__(self, decoder: VideoDecoder, target_fps: float):
-        self.decoder = decoder
+    def __init__(self, video_path: str, target_fps: float):
+        decord.bridge.set_bridge("torch")
         self.target_fps = target_fps
+        self.video = decord.VideoReader(video_path, ctx=decord.cpu(0))
 
-        meta = decoder.metadata
-        self.orig_fps = float(meta.average_fps_from_header)
-        self.orig_total_frames = int(meta.num_frames)
+        self.orig_total_frames = len(self.video)
+        # decord 有 average FPS 属性，但不一定总是准确，可用 metadata
+        try:
+            self.orig_fps = float(self.video.get_avg_fps())
+        except Exception:
+            self.orig_fps = target_fps  # fallback
 
         if (target_fps - self.orig_fps) > 0.1:
             raise ValueError(f"Target fps: {target_fps} should not be larger than original fps: {self.orig_fps}")
 
         self.duration = self.orig_total_frames / self.orig_fps
-
         self.new_total_frames = max(1, int(round(self.duration * self.target_fps)))
-
         self._metadata = self._build_metadata()
 
     def _build_metadata(self):
@@ -235,34 +215,26 @@ class ResampledVideoDecoder:
         return self._metadata
 
     def _map_indices(self, target_indices):
-        """
-        将 target-fps 时间轴上的 indices
-        映射到原视频时间轴
-        """
         if self.new_total_frames == 1:
             return [0] * len(target_indices)
 
         mapped = []
-
         for idx in target_indices:
             orig_idx = round(idx / (self.new_total_frames - 1) * (self.orig_total_frames - 1))
             orig_idx = min(self.orig_total_frames - 1, max(0, orig_idx))
             mapped.append(orig_idx)
-
         return mapped
 
     def get_frames_at(self, indices):
-        """
-        indices 是 target-fps 时间轴上的索引
-        """
         mapped_indices = self._map_indices(indices)
-        return self.decoder.get_frames_at(mapped_indices)
+        frames = self.video.get_batch(mapped_indices)  # [N, H, W, C]
+        frames = frames.permute(0, 3, 1, 2)  # [N, C, H, W]
+        return frames
 
 
 class VideoData(Dataset):
-    def __init__(self, config, flip_p: float = 0.5, device="cpu", eval_sample_num=None):
+    def __init__(self, config, flip_p: float = 0.5, eval_sample_num=None):
         self.flip_p = flip_p
-        self.device = device
         self.eval_sample_num = eval_sample_num
 
         self.fps = config.fps
@@ -288,7 +260,7 @@ class VideoData(Dataset):
                 this_video_paths.append(item["video"])
 
         for video_path in this_video_paths:
-            decoder = self.build_video_decoder(video_path)
+            decoder = self._build_video_decoder(video_path, target_fps=self.fps)
             total_num_frames = decoder.metadata.num_frames
             valid = max(0, total_num_frames - self.frames + 1)
 
@@ -334,37 +306,27 @@ class VideoData(Dataset):
         return video_idx, start_frame
 
     @staticmethod
-    def _build_video_decoder(video_path, target_fps, device="cpu"):
-        decoder = VideoDecoder(
-            video_path,
-            # Interestingly `exact` mode takes less than approximate when we load the whole video
-            seek_mode="exact",
-            # Allow FFmpeg decide on the number of threads for efficiency
-            num_ffmpeg_threads=0,
-            device=device,
-        )
-        return ResampledVideoDecoder(decoder, target_fps)
+    def _build_video_decoder(video_path, target_fps):
+        return ResampledVideoDecoder(video_path, target_fps)
 
-    def build_video_decoder(self, video_path):
-        return self._build_video_decoder(video_path, self.fps, self.device)
-
-    def read_video_torchcodec(self, video_idx: int, start_frame: int):
+    def read_video_decord(self, video_idx: int, start_frame: int):
         """
-        Decode the video with torchcodec decoder.
+        Decode the video using ResampledVideoDecoder.
 
         Args:
-            video_path (`str`):
-                Path to the video file.
+            video_idx (int): index of the video in self.video_paths
+            start_frame (int): start frame index on target-fps timeline
 
         Returns:
-            torch.Tensor
+            torch.Tensor: [T, C, H, W] video clip
         """
         video_path = self.video_paths[video_idx]
 
-        decoder = self.build_video_decoder(video_path)
-        indices = list(range(start_frame, start_frame + self.frames))
+        decoder = self._build_video_decoder(video_path, target_fps=self.fps)
 
-        video = decoder.get_frames_at(indices=indices).data.contiguous()
+        indices = list(range(start_frame, start_frame + self.frames))
+        video = decoder.get_frames_at(indices=indices).contiguous()  # [T, C, H, W]
+
         video = self.apply_transformations(video)
         return video
 
@@ -386,7 +348,7 @@ class VideoData(Dataset):
         while True:
             video_idx, start_frame = self.idx_to_video_and_frame(idx)
             try:
-                video = self.read_video_torchcodec(video_idx, start_frame)
+                video = self.read_video_decord(video_idx, start_frame)
                 inputs = {"video": video}
                 break
             except Exception:
@@ -565,9 +527,8 @@ def load_unsampler_datasets_from_json(
     shuffle=True,
     drop_last=False,
     eval_sample_num=None,
-    device="cpu",
 ):
-    dataset = VideoData(config, flip_p=flip_p, device=device, eval_sample_num=eval_sample_num)
+    dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
 
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
@@ -616,7 +577,6 @@ def load_multi_datasets_form_json(
     drop_last=False,
     eval_sample_num=None,
     make_single_dataset=False,
-    device="cpu",
 ):
     if make_single_dataset:
         return load_unsampler_datasets_from_json(
@@ -629,7 +589,6 @@ def load_multi_datasets_form_json(
             shuffle=shuffle,
             drop_last=drop_last,
             eval_sample_num=eval_sample_num,
-            device=device,
         )
 
     with open(json_path, "r") as f:
@@ -644,7 +603,7 @@ def load_multi_datasets_form_json(
 
     for dataset_path in dataset_paths:
         dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
-        dataset = VideoData(config, flip_p=flip_p, device=device, eval_sample_num=eval_sample_num)
+        dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
         dataset.add(dataset_path)
         datasets.append(dataset)
 

@@ -12,9 +12,9 @@ projector:
   num_token: 8
   num_attn_layers: 6
   num_attn_compress_layers: 6
-  hidden_dim: 2048
-  output_align_dim: 2048
-  cross_attention_dim: 1024
+  hidden_dim: 4096
+  output_align_dim: 4096
+  cross_attention_dim: 2048
 
 wanva:
   token_dropout: False
@@ -25,10 +25,10 @@ wanva:
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
-  fps: 2
-  frames: 5
-  num_workers: 32
-  image_size: [480, 640]
+  fps: 24
+  frames: 4
+  num_workers: 16
+  image_size: [320, 384]
   train_json_path: ./jsons/train_XVLA.json
   eval_json_path: ./jsons/eval_XVLA.json
 
@@ -36,12 +36,12 @@ train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 1800
-  save_step: 1800
-  local_batch_size: 8
+  eval_step: 5000
+  save_step: 5000
+  local_batch_size: 16
   eval_sample_num: 4
   learning_rate: 3e-5
+  warmup_ratio: 0.0001
   decay: 1e-3
   ckpt_save_dir: ckpts
-  max_grad_norm: 1.0
-  gradient_accumulate_steps: 2
+  gradient_accumulate_steps: 1

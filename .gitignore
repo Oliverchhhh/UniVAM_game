@@ -179,10 +179,12 @@ test/
 jsons/
 logs/
 ckpts/
+ckpts
 *_test_*
 
 # special files
 .sii/
 core*
 scripts/train_mutil.sh
-
+kernel_meta/
+fusion_result.json
