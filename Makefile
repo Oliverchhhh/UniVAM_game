@@ -3,7 +3,7 @@ k ?= 1
 
 .PHONY: quality style clean
 
-check_dirs := src scripts train.py download_models.py
+check_dirs := src scripts train.py eval.py download_models.py
 exclude_dirs := tests
 
 quality:
@@ -15,4 +15,4 @@ style:
 	ruff format $(check_dirs) --exclude $(exclude_dirs)
 
 clean:
-	@bash scripts/clean_cache.sh -r $(r) -k $(k)
+	@bash scripts/envs/clean_cache.sh -r $(r) -k $(k)

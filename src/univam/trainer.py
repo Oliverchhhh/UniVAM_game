@@ -12,7 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from univam.models.wanva import Wan22VisionActionModel
-from univam.utils.data import check_tensor, fp32_to_bf16, move_to_cuda
+from univam.utils.data import check_tensor, complex_to_device, fp32_to_bf16, move_to_cuda
 from univam.utils.files import ensure_directory, ensure_dirname
 from univam.utils.metrics import Meter, Timer, calculate_psnr, calculate_ssim, get_parameters
 from univam.utils.overwatch import initialize_overwatch
@@ -62,6 +62,17 @@ class Trainer:
         OmegaConf.resolve(args)
         if overwatch.is_rank_zero():
             OmegaConf.save(args, os.path.join(self.ckpt_save_dir, "config.yaml"))
+
+    def move_model_to_device(self) -> None:
+        self.model.to(self.device)
+        if self.optimizer is not None:
+            if isinstance(self.optimizer, list):
+                for i in range(len(self.optimizer)):
+                    self.optimizer[i].load_state_dict(
+                        complex_to_device(self.optimizer[i].state_dict(), device=self.device)
+                    )
+            else:
+                self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
 
     def prepare_dist_model(self) -> None:
         self.accelerator = Accelerator(

@@ -3,14 +3,10 @@ import math
 import os
 import random
 
-import decord
-import jsonlines
 import numpy as np
 import torch
 import torch.distributed as dist
-from PIL.Image import Resampling
 from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
-from torchvision.transforms import functional as F
 
 from univam.utils.overwatch import initialize_overwatch
 
@@ -33,6 +29,23 @@ def set_seed(seed: int):
         torch.use_deterministic_algorithms(True)
     except Exception:
         pass
+
+
+def complex_to_device(complex, device, non_blocking=False):
+    if complex is None:
+        return complex
+    if isinstance(complex, torch.Tensor):
+        return complex.to(device, non_blocking=non_blocking)
+    elif isinstance(complex, dict):
+        return {k: complex_to_device(v, device, non_blocking=non_blocking) for k, v in complex.items()}
+    elif isinstance(complex, list) or isinstance(complex, tuple):
+        return [complex_to_device(e, device, non_blocking=non_blocking) for e in complex]
+    elif (
+        isinstance(complex, str) or isinstance(complex, bytes) or isinstance(complex, int) or isinstance(complex, float)
+    ):
+        return complex
+    else:
+        raise ValueError("Unsupported complex", complex)
 
 
 def fp32_to_fp16(batch):
@@ -179,187 +192,6 @@ def get_loader_info(dataset_len, epochs, bsz, gradient_accumulate_steps):
     num_iters = iter_per_ep * epochs
     loader_info = (images_per_gpu, images_per_batch, iter_per_ep, num_iters)
     return loader_info
-
-
-class ResampledVideoDecoder:
-    def __init__(self, video_path: str, target_fps: float):
-        decord.bridge.set_bridge("torch")
-        self.target_fps = target_fps
-        self.video = decord.VideoReader(video_path, ctx=decord.cpu(0))
-
-        self.orig_total_frames = len(self.video)
-        # decord 有 average FPS 属性，但不一定总是准确，可用 metadata
-        try:
-            self.orig_fps = float(self.video.get_avg_fps())
-        except Exception:
-            self.orig_fps = target_fps  # fallback
-
-        if (target_fps - self.orig_fps) > 0.1:
-            raise ValueError(f"Target fps: {target_fps} should not be larger than original fps: {self.orig_fps}")
-
-        self.duration = self.orig_total_frames / self.orig_fps
-        self.new_total_frames = max(1, int(round(self.duration * self.target_fps)))
-        self._metadata = self._build_metadata()
-
-    def _build_metadata(self):
-        class Meta:
-            pass
-
-        m = Meta()
-        m.fps = self.target_fps
-        m.num_frames = self.new_total_frames
-        return m
-
-    @property
-    def metadata(self):
-        return self._metadata
-
-    def _map_indices(self, target_indices):
-        if self.new_total_frames == 1:
-            return [0] * len(target_indices)
-
-        mapped = []
-        for idx in target_indices:
-            orig_idx = round(idx / (self.new_total_frames - 1) * (self.orig_total_frames - 1))
-            orig_idx = min(self.orig_total_frames - 1, max(0, orig_idx))
-            mapped.append(orig_idx)
-        return mapped
-
-    def get_frames_at(self, indices):
-        mapped_indices = self._map_indices(indices)
-        frames = self.video.get_batch(mapped_indices)  # [N, H, W, C]
-        frames = frames.permute(0, 3, 1, 2)  # [N, C, H, W]
-        return frames
-
-
-class VideoData(Dataset):
-    def __init__(self, config, flip_p: float = 0.5, eval_sample_num=None):
-        self.flip_p = flip_p
-        self.eval_sample_num = eval_sample_num
-
-        self.fps = config.fps
-        self.frames = config.frames
-        self.image_size = config.image_size
-
-        self.length = 0
-        self.video_paths = []
-        self.video_lengths = []
-        self.video_start_indices = []
-
-        self.video_mean = torch.tensor([127.5, 127.5, 127.5])
-        self.video_std = torch.tensor([127.5, 127.5, 127.5])
-
-    def add(self, metadata_path):
-        this_length = 0
-        this_video_paths = []
-        this_video_lengths = []
-        this_video_start_indices = []
-
-        with open(metadata_path, "r+", encoding="utf8") as f:
-            for item in jsonlines.Reader(f):
-                this_video_paths.append(item["video"])
-
-        for video_path in this_video_paths:
-            decoder = self._build_video_decoder(video_path, target_fps=self.fps)
-            total_num_frames = decoder.metadata.num_frames
-            valid = max(0, total_num_frames - self.frames + 1)
-
-            if valid <= 0:
-                this_video_lengths.append(0)
-                this_video_start_indices.append([])
-                continue
-
-            if self.eval_sample_num is not None:
-                k = min(self.eval_sample_num, valid)
-                starts = random.sample(range(valid), k)
-
-                this_video_lengths.append(k)
-                this_video_start_indices.append(starts)
-            else:
-                this_video_lengths.append(valid)
-                this_video_start_indices.append(None)
-
-        this_length = sum(this_video_lengths)
-
-        self.length += this_length
-        self.video_paths.extend(this_video_paths)
-        self.video_lengths.extend(this_video_lengths)
-        self.video_start_indices.extend(this_video_start_indices)
-
-        overwatch.info(f"{this_length} data loaded from {metadata_path}")
-
-    def idx_to_video_and_frame(self, idx: int):
-        video_idx = -1
-        total_frame = 0
-
-        while idx - total_frame >= 0:
-            video_idx += 1
-            total_frame += self.video_lengths[video_idx]
-
-        local_idx = idx - (total_frame - self.video_lengths[video_idx])
-
-        if self.eval_sample_num is not None:
-            start_frame = self.video_start_indices[video_idx][local_idx]
-        else:
-            start_frame = local_idx
-
-        return video_idx, start_frame
-
-    @staticmethod
-    def _build_video_decoder(video_path, target_fps):
-        return ResampledVideoDecoder(video_path, target_fps)
-
-    def read_video_decord(self, video_idx: int, start_frame: int):
-        """
-        Decode the video using ResampledVideoDecoder.
-
-        Args:
-            video_idx (int): index of the video in self.video_paths
-            start_frame (int): start frame index on target-fps timeline
-
-        Returns:
-            torch.Tensor: [T, C, H, W] video clip
-        """
-        video_path = self.video_paths[video_idx]
-
-        decoder = self._build_video_decoder(video_path, target_fps=self.fps)
-
-        indices = list(range(start_frame, start_frame + self.frames))
-        video = decoder.get_frames_at(indices=indices).contiguous()  # [T, C, H, W]
-
-        video = self.apply_transformations(video)
-        return video
-
-    def apply_transformations(self, video: torch.Tensor):
-        """
-        Apply flip and reshape to the frames in the video.
-        """
-        video = F.resize(video, self.image_size, interpolation=Resampling.BICUBIC)
-        if random.random() < self.flip_p:
-            video = F.hflip(video)
-
-        video = F.normalize(video.to(dtype=torch.float32), self.video_mean, self.video_std)
-        return video
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        while True:
-            video_idx, start_frame = self.idx_to_video_and_frame(idx)
-            try:
-                video = self.read_video_decord(video_idx, start_frame)
-                inputs = {"video": video}
-                break
-            except Exception:
-                overwatch.error(f"read {self.video_paths[video_idx]}, start_frame: {start_frame} error")
-                idx = random.randint(0, self.length - 1)
-        return inputs
-
-
-def collate_fn(inputs):
-    videos = torch.stack([input["video"] for input in inputs])
-    return {"videos": videos}
 
 
 def worker_init_fn(worker_id):
@@ -528,7 +360,14 @@ def load_unsampler_datasets_from_json(
     drop_last=False,
     eval_sample_num=None,
 ):
-    dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
+    if config.type == "video":
+        from univam.utils.dataloaders.video import VideoData, collate_fn
+
+        dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
+    elif config.type == "hdf5":
+        from univam.utils.dataloaders.hdf5 import EpisodeData, collate_fn
+
+        dataset = EpisodeData(config, orig_fps=24, flip_p=flip_p, eval_sample_num=eval_sample_num)
 
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
@@ -591,6 +430,15 @@ def load_multi_datasets_form_json(
             eval_sample_num=eval_sample_num,
         )
 
+    if config.type == "video":
+        from univam.utils.dataloaders.video import VideoData, collate_fn
+
+        dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
+    elif config.type == "hdf5":
+        from univam.utils.dataloaders.hdf5 import EpisodeData, collate_fn
+
+        dataset = EpisodeData(config, orig_fps=24, flip_p=flip_p, eval_sample_num=eval_sample_num)
+
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
     dataset_paths = meta_infos["datasets"]
@@ -603,7 +451,6 @@ def load_multi_datasets_form_json(
 
     for dataset_path in dataset_paths:
         dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
-        dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
         dataset.add(dataset_path)
         datasets.append(dataset)
 
@@ -641,16 +488,6 @@ if __name__ == "__main__":
     from univam.utils.args import load_args
 
     args = load_args()
-
-    # test for single dataset
-    dataset = VideoData(args.data)
-    dataset.add(metadata_path="jsons/train_debug_part_0.jsonl")
-
-    dataloader = DataLoader(dataset, batch_size=4, num_workers=0, collate_fn=collate_fn, shuffle=True, drop_last=False)
-    data = next(iter(dataloader))
-
-    print(f"Dataset length: {len(dataset)}")
-    print(f"Video shape: {data['videos'].shape}")
 
     # test for multi datasets / dataloader
     dataloader = load_multi_datasets_form_json(

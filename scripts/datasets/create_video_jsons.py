@@ -2,6 +2,7 @@ import json
 import os
 import random
 from collections import defaultdict
+from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
@@ -107,10 +108,14 @@ def create_split_jsonl(
 if __name__ == "__main__":
     load_dotenv()
 
-    dataset_path = os.environ.get("DATASETS_PATH", "./datasets")
+    dataset_path = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
-    train_video_dirs = [os.path.join(dataset_path, "XVLA-Soft-Fold-Videos/train")]
+    train_video_dirs = [
+        dataset_path / "XVLA-Soft-Fold-Videos/train",
+    ]
 
-    eval_video_dirs = [os.path.join(dataset_path, "XVLA-Soft-Fold-Videos/eval")]
+    eval_video_dirs = [
+        dataset_path / "XVLA-Soft-Fold-Videos/eval",
+    ]
 
     create_split_jsonl(train_video_dirs, eval_video_dirs, "XVLA", shared_train_num=1, eval_num=1)

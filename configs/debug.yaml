@@ -19,16 +19,17 @@ projector:
 wanva:
   token_dropout: False
   guidance_scale: 1.0
-  num_inference_steps: 100
+  num_inference_steps: 20
   patch_size: [1, 2, 2]
   num_attention_heads: 24
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
+  type: video # video | hdf5
   fps: 24
   frames: 4
   num_workers: 16
-  image_size: [256, 256]
+  image_size: [480, 640]
   train_json_path: ./jsons/train_debug.json
   eval_json_path: ./jsons/eval_debug.json
 
@@ -36,8 +37,8 @@ train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 500
-  save_step: 500
+  eval_step: 100
+  save_step: 100
   local_batch_size: 16
   eval_sample_num: 4
   learning_rate: 3e-5
