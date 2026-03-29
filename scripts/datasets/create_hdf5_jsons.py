@@ -108,21 +108,21 @@ if __name__ == "__main__":
     dataset_path = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
     train_hdf5_map = {
-        "robotwin": dataset_path / "robotwin/train",
+        # "robotwin": dataset_path / "robotwin/train",
         "XVLA": dataset_path / "XVLA-Soft-Fold/train",
-        "libero": dataset_path / "LIBERO-Cosmos-Policy/all_episodes/train",
+        # "libero": dataset_path / "LIBERO-Cosmos-Policy/all_episodes/train",
     }
 
     eval_hdf5_map = {
-        "robotwin": dataset_path / "robotwin/eval",
+        # "robotwin": dataset_path / "robotwin/eval",
         "XVLA": dataset_path / "XVLA-Soft-Fold/eval",
-        "libero": dataset_path / "LIBERO-Cosmos-Policy/all_episodes/eval",
+        # "libero": dataset_path / "LIBERO-Cosmos-Policy/all_episodes/eval",
     }
 
     create_split_jsonl(
         train_hdf5_map,
         eval_hdf5_map,
-        dataset_name="mix",
+        dataset_name="XVLA",
         shared_train_num=1,
         eval_num=1,
     )

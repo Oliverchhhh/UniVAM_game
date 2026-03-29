@@ -189,40 +189,34 @@ class QformerProjector(nn.Module):
 if __name__ == "__main__":
     from fvcore.nn import FlopCountAnalysis
 
-    from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
     from univam.utils.args import load_args
 
     args = load_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    video_feature_extractor = Qwen3VLVideoFeatureExtractor(
-        args.video_feature_extractor,
-        frames=args.data.frames,
-        image_size=args.data.image_size,
-    ).to(device)
+    patches = 2 * 15 * 20
+    channels = 24 * 128
 
     if args.projector.type == "mlp":
         model = MLPProjector(
             args.projector,
-            patches=video_feature_extractor.patches,
-            channels=video_feature_extractor.out_hidden_size,
+            patches=patches,
+            channels=channels,
         ).to(device)
         print(f"Token compression process: {model.compress_dims}")
     elif args.projector.type == "qformer":
         model = QformerProjector(
             args.projector,
-            patches=video_feature_extractor.patches,
-            channels=video_feature_extractor.out_hidden_size,
+            patches=patches,
+            channels=channels,
         ).to(device)
     else:
         raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
 
     batch_size = 2
 
-    video_pooler_feature = torch.randn(
-        batch_size, video_feature_extractor.patches, video_feature_extractor.out_hidden_size
-    ).to(device)
+    video_pooler_feature = torch.randn(batch_size, patches, channels).to(device)
 
     compressed_embeds = model(video_pooler_feature)
 

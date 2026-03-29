@@ -70,7 +70,11 @@ def main(args):
     overwatch.info(f"SSIM: {ssim:.4f}")
 
     video_path = os.path.join("tests", "eval")
+    gt_video_path = os.path.join(video_path, "gt")
+    pred_video_path = os.path.join(video_path, "pred")
     ensure_directory(video_path)
+    ensure_directory(gt_video_path)
+    ensure_directory(pred_video_path)
 
     for i in range(pred_videos.shape[0]):
         gt_np = (label_videos[i].permute(0, 2, 3, 1).float().cpu().numpy() * 255).astype(np.uint8)
@@ -87,7 +91,7 @@ def main(args):
         for img in gt_frames:
             gt_concat.paste(img, (x_offset, 0))
             x_offset += img.size[0]
-        gt_concat.save(os.path.join(video_path, f"{i}_gt_video.jpg"))
+        gt_concat.save(os.path.join(gt_video_path, f"{i:02d}_gt_video.jpg"))
 
         widths, heights = zip(*(img.size for img in pred_frames))
         total_width = sum(widths)
@@ -97,7 +101,15 @@ def main(args):
         for img in pred_frames:
             pred_concat.paste(img, (x_offset, 0))
             x_offset += img.size[0]
-        pred_concat.save(os.path.join(video_path, f"{i}_pred_video.jpg"))
+        pred_concat.save(os.path.join(pred_video_path, f"{i:02d}_pred_video.jpg"))
+
+        if pred_concat.size != gt_concat.size:
+            pred_concat = pred_concat.resize(gt_concat.size)
+        w, h = gt_concat.size
+        final_img = Image.new("RGB", (w, h * 2))
+        final_img.paste(gt_concat, (0, 0))
+        final_img.paste(pred_concat, (0, h))
+        final_img.save(os.path.join(video_path, f"{i:02d}.jpg"))
 
 
 if __name__ == "__main__":

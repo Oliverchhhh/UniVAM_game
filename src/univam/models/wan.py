@@ -182,6 +182,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
+        self.inner_dim = inner_dim
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -351,7 +352,8 @@ def test_transformer3d(args, video_latents, device, dtype):
 
 if __name__ == "__main__":
     from univam.utils.args import load_args
-    from univam.utils.data import VideoData, set_seed
+    from univam.utils.data import set_seed
+    from univam.utils.dataloaders.video import VideoData
 
     args = load_args()
     set_seed(args.seed)

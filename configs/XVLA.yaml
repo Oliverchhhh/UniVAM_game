@@ -5,8 +5,6 @@ resume: False
 resume_path: null
 task_name: XVLA
 
-video_feature_extractor: ${oc.load:configs/qwen3_vl/vision_config_8b.yaml}
-
 projector:
   type: qformer # mlp | qformer
   num_token: 8
@@ -25,9 +23,9 @@ wanva:
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
-  type: video # video | hdf5
+  type: hdf5 # video | hdf5
   fps: 24
-  frames: 4
+  frames: 5
   num_workers: 16
   image_size: [480, 640]
   train_json_path: ./jsons/train_XVLA.json
@@ -37,12 +35,12 @@ train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 5000
-  save_step: 5000
-  local_batch_size: 16
+  eval_step: 2500
+  save_step: 2500
+  local_batch_size: 8
   eval_sample_num: 4
   learning_rate: 3e-5
   warmup_ratio: 0.0001
   decay: 1e-3
   ckpt_save_dir: ckpts
-  gradient_accumulate_steps: 1
+  gradient_accumulate_steps: 2

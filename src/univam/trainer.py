@@ -350,7 +350,11 @@ class Trainer:
                 )
 
                 video_path = os.path.join(self.log_dir, "videos", str(self.global_step))
+                gt_video_path = os.path.join(video_path, "gt")
+                pred_video_path = os.path.join(video_path, "pred")
                 ensure_directory(video_path)
+                ensure_directory(gt_video_path)
+                ensure_directory(pred_video_path)
 
                 to_tensor = T.ToTensor()
                 gt_concat_tensors = []
@@ -371,7 +375,7 @@ class Trainer:
                     for img in gt_frames:
                         gt_concat.paste(img, (x_offset, 0))
                         x_offset += img.size[0]
-                    gt_concat.save(os.path.join(video_path, f"{i}_gt_video.jpg"))
+                    gt_concat.save(os.path.join(gt_video_path, f"{i:02d}_gt_video.jpg"))
                     gt_concat_tensors.append(to_tensor(gt_concat))
 
                     widths, heights = zip(*(img.size for img in pred_frames))
@@ -382,8 +386,16 @@ class Trainer:
                     for img in pred_frames:
                         pred_concat.paste(img, (x_offset, 0))
                         x_offset += img.size[0]
-                    pred_concat.save(os.path.join(video_path, f"{i}_pred_video.jpg"))
+                    pred_concat.save(os.path.join(pred_video_path, f"{i:02d}_pred_video.jpg"))
                     pred_concat_tensors.append(to_tensor(pred_concat))
+
+                    if pred_concat.size != gt_concat.size:
+                        pred_concat = pred_concat.resize(gt_concat.size)
+                    w, h = gt_concat.size
+                    final_img = Image.new("RGB", (w, h * 2))
+                    final_img.paste(gt_concat, (0, 0))
+                    final_img.paste(pred_concat, (0, h))
+                    final_img.save(os.path.join(video_path, f"{i:02d}.jpg"))
 
                 gt_concat_batch = torch.stack(gt_concat_tensors, dim=0)
                 pred_concat_batch = torch.stack(pred_concat_tensors, dim=0)

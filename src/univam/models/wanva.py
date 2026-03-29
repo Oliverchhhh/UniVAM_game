@@ -6,7 +6,6 @@ import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
-from univam.models.deepstack import Qwen3VLVideoFeatureExtractor
 from univam.models.projector import MLPProjector, QformerProjector
 from univam.models.scheduler import FlowMatchScheduler
 from univam.models.wan import WanTransformer3DModel, WanVAE
@@ -34,36 +33,21 @@ class Wan22VisionActionModel(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
 
-        self.video_feature_extractor = Qwen3VLVideoFeatureExtractor(
-            config.video_feature_extractor,
+        self.wanvae = WanVAE(
+            config.wanva.model_path,
             frames=config.data.frames,
-            image_size=config.data.image_size,
         )
-
-        if config.projector.type == "mlp":
-            self.projector = MLPProjector(
-                config.projector,
-                self.video_feature_extractor.patches,
-                self.video_feature_extractor.out_hidden_size,
-            )
-        elif config.projector.type == "qformer":
-            self.projector = QformerProjector(
-                config.projector,
-                self.video_feature_extractor.patches,
-                self.video_feature_extractor.out_hidden_size,
-            )
-        else:
-            raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
-
-        self.wanvae = WanVAE(config.wanva.model_path)
         # self.vae_scale_factor_spatial = self.wanvae.vae.config.scale_factor_spatial
         # self.vae_scale_factor_temporal = self.wanvae.vae.config.scale_factor_temporal
 
         height, width = config.data.image_size
         self.latent_t_num = self.wanvae.latent_t_num
+        self.num_channels_latents = self.wanvae.vae.config.z_dim
 
         self.vae_height = height // self.wanvae.vae.config.scale_factor_spatial
         self.vae_width = width // self.wanvae.vae.config.scale_factor_spatial
+
+        self.patch_size = config.wanva.patch_size
 
         self.transformer3d = WanTransformer3DModel.from_pretrained(
             config.wanva.model_path,
@@ -76,7 +60,33 @@ class Wan22VisionActionModel(nn.Module):
         )
         self.transformer3d.init_weights()
 
-        self.num_channels_latents = self.transformer3d.config.in_channels
+        self.patch_embedding = nn.Conv3d(
+            self.wanvae.vae.config.z_dim,
+            self.transformer3d.inner_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+
+        patches = (
+            (self.latent_t_num // self.patch_size[0])
+            * (self.vae_height // self.patch_size[1])
+            * (self.vae_width // self.patch_size[2])
+        )
+
+        if config.projector.type == "mlp":
+            self.projector = MLPProjector(
+                config.projector,
+                patches=patches,
+                channels=self.transformer3d.inner_dim,
+            )
+        elif config.projector.type == "qformer":
+            self.projector = QformerProjector(
+                config.projector,
+                patches=patches,
+                channels=self.transformer3d.inner_dim,
+            )
+        else:
+            raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
@@ -119,9 +129,6 @@ class Wan22VisionActionModel(nn.Module):
 
         self.wanvae.eval()
         self.wanvae.requires_grad_(False)
-
-        self.video_feature_extractor.eval()
-        self.video_feature_extractor.requires_grad_(False)
 
     def _save_ckpt(self, model_dict: Dict, projector_model_dict: Dict, save_path: str, global_step: int) -> None:
         exclude_prefixes = ["wanvae", "projector", "video_feature_extractor"]
@@ -193,15 +200,13 @@ class Wan22VisionActionModel(nn.Module):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def encode(self, videos: torch.Tensor, do_classifier_free_guidance: bool = False):
+    def encode(self, video_latents: torch.Tensor, do_classifier_free_guidance: bool = False):
         dtype = next(self.projector.parameters()).dtype
-        videos = videos.to(device=self.device, dtype=dtype)
+        video_latents = video_latents.to(device=self.device, dtype=dtype)
+        video_latents = self.patch_embedding(video_latents)
+        video_latents = video_latents.flatten(2).transpose(1, 2)
 
-        pixel_values_videos, video_grid_thw = self.video_feature_extractor.preprocess(videos)
-        video_pooler_feature = self.video_feature_extractor(pixel_values_videos, video_grid_thw)
-        check_tensor(video_pooler_feature, "video_pooler_feature")
-
-        video_embeds = self.projector(video_pooler_feature)
+        video_embeds = self.projector(video_latents)
         check_tensor(video_embeds, "video_embeds")
 
         if self.token_dropout:
@@ -218,17 +223,12 @@ class Wan22VisionActionModel(nn.Module):
     def train_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
         videos: torch.Tensor = inputs["videos"]  # [B, T, C, H, W]
 
-        batch_size = videos.shape[0]
-
-        video_embeds = self.encode(videos)
-
         video_latents = self.wanvae.encode(videos)
         video_latents = video_latents.to(dtype=self.dtype)
-        check_tensor(video_latents, "video_latents")
+
+        video_embeds = self.encode(video_latents)
 
         video_noise = torch.randn_like(video_latents, dtype=self.dtype)
-
-        timestep_id = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,))
 
         timestep_id = sample_timestep_id(
             batch_size=videos.shape[0],
@@ -262,8 +262,10 @@ class Wan22VisionActionModel(nn.Module):
         videos = inputs["videos"]
         generator = inputs["generator"]
 
+        video_latents = self.wanvae.encode(videos)
+
         do_classifier_free_guidance = self.guidance_scale > 1.0
-        video_embeds = self.encode(videos, do_classifier_free_guidance=do_classifier_free_guidance)
+        video_embeds = self.encode(video_latents, do_classifier_free_guidance=do_classifier_free_guidance)
 
         self.eval_scheduler.set_timesteps(self.num_inference_steps)
         timesteps = self.eval_scheduler.timesteps

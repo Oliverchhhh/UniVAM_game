@@ -301,6 +301,7 @@ class EpisodeData(Dataset):
             else:
                 this_video_lengths.append(valid)
                 this_video_start_indices.append(None)
+            # overwatch.info(f"{valid} data loaded from {path}")
 
         this_length = sum(this_video_lengths)
 
