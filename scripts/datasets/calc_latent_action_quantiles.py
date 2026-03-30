@@ -22,16 +22,20 @@ load_dotenv()
 # Reduce intra-op threading to avoid oversubscription when using many processes
 torch.set_num_threads(1)
 
+ACTION_KEYS = {
+    "robotwin": "/joint_action/vector",
+    "XVLA": "/action",
+    "libero": "/actions",
+}
 
-def _load_action_tensor(hdf5_path: Path) -> Optional[np.ndarray]:
+
+def _load_action_tensor(hdf5_path: Path, action_key: str) -> Optional[np.ndarray]:
     try:
         with h5py.File(hdf5_path, "r") as f:
-            if "joint_action" not in f:
-                return None
-            if "vector" not in f["joint_action"]:
+            if action_key not in f:
                 return None
 
-            data = f["joint_action"]["vector"][:]
+            data = f[action_key][:]
 
             if data.ndim == 1:
                 data = data[None]
@@ -42,13 +46,15 @@ def _load_action_tensor(hdf5_path: Path) -> Optional[np.ndarray]:
         return None
 
 
-def minmax_worker(files):
+def minmax_worker(args):
+    files, action_key = args
+
     gmin = None
     gmax = None
     used = 0
 
     for fp in files:
-        data = _load_action_tensor(Path(fp))
+        data = _load_action_tensor(Path(fp), action_key)
         if data is None:
             continue
 
@@ -71,7 +77,7 @@ def minmax_worker(files):
 
 
 def hist_worker(args):
-    files, gmin, gmax, num_bins = args
+    files, gmin, gmax, num_bins, action_key = args
 
     D = len(gmin)
     hist = np.zeros((D, num_bins), dtype=np.int64)
@@ -82,7 +88,7 @@ def hist_worker(args):
     edges = [np.linspace(gmin[i] - eps, gmax[i] + eps, num_bins + 1) for i in range(D)]
 
     for fp in files:
-        data = _load_action_tensor(Path(fp))
+        data = _load_action_tensor(Path(fp), action_key)
         if data is None:
             continue
 
@@ -162,6 +168,7 @@ def _compute_from_files(
     *,
     num_workers: int,
     num_bins: int,
+    action_key: str,
 ) -> Tuple[np.ndarray, np.ndarray, int, int, int]:
     if not files:
         raise RuntimeError("No files to process")
@@ -175,7 +182,7 @@ def _compute_from_files(
     ctx = get_context("spawn")
     with ctx.Pool(processes=num_workers, maxtasksperchild=32) as pool:
         for mn, mx, used in tqdm(
-            pool.imap_unordered(minmax_worker, chunks, chunksize=1),
+            pool.imap_unordered(minmax_worker, [(ch, action_key) for ch in chunks], chunksize=1),
             total=len(chunks),
             desc="Pass1 min/max",
         ):
@@ -196,7 +203,7 @@ def _compute_from_files(
     total_rows = 0
     with ctx.Pool(processes=num_workers, maxtasksperchild=32) as pool:
         for path, rows in tqdm(
-            pool.imap_unordered(hist_worker, [(ch, gmin, gmax, num_bins) for ch in chunks], chunksize=1),
+            pool.imap_unordered(hist_worker, [(ch, gmin, gmax, num_bins, action_key) for ch in chunks], chunksize=1),
             total=len(chunks),
             desc="Pass2 hist",
         ):
@@ -252,6 +259,11 @@ def main() -> None:
     args = parser.parse_args()
     recursive = not args.no_recursive
 
+    if args.dataset not in ACTION_KEYS:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    action_key = ACTION_KEYS[args.dataset]
+
     # Determine file list
     files: Optional[List[str]] = None
     input_dir_str: Optional[str] = None
@@ -264,6 +276,9 @@ def main() -> None:
     elif args.input_dir:
         input_dir = Path(args.input_dir) / Path(args.dataset)
         files = [str(p) for p in _iter_pt_files(input_dir, recursive, args.pattern)]
+        if len(files) == 0:
+            input_dir = Path(args.input_dir)
+            files = [str(p) for p in _iter_pt_files(input_dir, recursive, args.pattern)]
         input_dir_str = str(input_dir.resolve())
     else:
         raise RuntimeError("Either --cfg or --input-dir must be provided")
@@ -272,6 +287,7 @@ def main() -> None:
         files,
         num_workers=max(1, args.num_workers),
         num_bins=max(64, args.num_bins),
+        action_key=action_key,
     )
 
     out = {

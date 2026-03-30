@@ -145,11 +145,13 @@ class Wan22VisionActionModel(nn.Module):
         overwatch.warning(f"loading checkpoints from {load_path}")
 
         def _log_missing_unexpected(title, missing_keys, unexpected_keys):
-            def extract_top_level(keys):
-                return sorted({k.split(".")[0] for k in keys})
+            def extract_top_level(keys, k=1):
+                if k <= 0:
+                    raise ValueError("k must be >= 1")
+                return sorted({".".join(key.split(".")[:k]) for key in keys})
 
-            top_missing = extract_top_level(missing_keys)
-            top_unexpected = extract_top_level(unexpected_keys)
+            top_missing = extract_top_level(missing_keys, k=1)
+            top_unexpected = extract_top_level(unexpected_keys, k=2)
 
             overwatch.warning(f"{title} - Missing top-level keys: {top_missing}")
             overwatch.warning(f"{title} - Unexpected top-level keys: {top_unexpected}")
@@ -240,10 +242,10 @@ class Wan22VisionActionModel(nn.Module):
 
         target = self.scheduler.training_target(video_latents, video_noise, timesteps)
 
-        model_pred_video_latents = self.transformer3d(
-            timestep=timesteps,
-            hidden_states_video=video_noisy_latents,
-            encoder_hidden_states_video=video_embeds,
+        model_pred_video_latents, _ = self.transformer3d(
+            video_timestep=timesteps,
+            video_hidden_states=video_noisy_latents,
+            encoder_hidden_states=video_embeds,
         )
         check_tensor(model_pred_video_latents, "model_pred_video_latents", check_bound=100, check_std=10)
 
@@ -285,10 +287,10 @@ class Wan22VisionActionModel(nn.Module):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
                 timestep = t.expand(latent_model_input.shape[0])
-                noise_pred_video = self.transformer3d(
-                    timestep=timestep,
-                    hidden_states_video=latent_model_input,
-                    encoder_hidden_states_video=video_embeds,
+                noise_pred_video, _ = self.transformer3d(
+                    video_timestep=timestep,
+                    video_hidden_states=latent_model_input,
+                    encoder_hidden_states=video_embeds,
                 )
 
                 if do_classifier_free_guidance:
