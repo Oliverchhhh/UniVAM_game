@@ -55,6 +55,9 @@ class Trainer:
         self.log_dir = os.path.join(args.log_dir, args.task_name)
         self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name)
 
+        self.train_with_action = args.train.train_with_action
+        self.model.set_train_mode(self.train_with_action)
+
         if overwatch.is_rank_zero() and args.do_train:
             ensure_directory(self.log_dir)
             ensure_directory(self.ckpt_save_dir)
@@ -297,6 +300,9 @@ class Trainer:
         label_videos = []
         pred_videos = []
 
+        label_actions = []
+        pred_actions = []
+
         with torch.no_grad():
             if overwatch.is_rank_zero():
                 eval_loader = tqdm(eval_loader, total=len(eval_loader), ncols=150, dynamic_ncols=False)
@@ -320,6 +326,10 @@ class Trainer:
                 label_videos.append(label_video)
                 pred_videos.append(pred_video)
 
+                if self.train_with_action:
+                    label_actions.append(outputs["input_actions"])
+                    pred_actions.append(outputs["actions"])
+
             label_videos = torch.cat(label_videos, dim=0)
             pred_videos = torch.cat(pred_videos, dim=0)
 
@@ -340,6 +350,14 @@ class Trainer:
             overwatch.info(f"SSIM: {eval_meter.avg['val/ssim']:.4f}")
             # overwatch.info(f"rFID: {calculate_rfid(pred_imgs, label_imgs):.4f}")
 
+            if self.train_with_action:
+                label_actions = torch.cat(label_actions, dim=0)
+                pred_actions = torch.cat(pred_actions, dim=0)
+                mse = torch.nn.functional.mse_loss(pred_actions, label_actions)
+                mse = self.reduce_mean(mse)
+                eval_meter.update({"val/mse": mse})
+                overwatch.info(f"MSE: {eval_meter.avg['val/mse']:.4f}")
+
             if overwatch.is_rank_zero():
                 self.accelerator.log(
                     {
@@ -348,6 +366,9 @@ class Trainer:
                     },
                     step=self.global_step,
                 )
+
+                if self.train_with_action:
+                    self.accelerator.log({"val/mse": eval_meter.avg["val/mse"]}, step=self.global_step)
 
                 video_path = os.path.join(self.log_dir, "videos", str(self.global_step))
                 gt_video_path = os.path.join(video_path, "gt")

@@ -3,7 +3,7 @@ do_train: True
 log_dir: logs
 resume: False
 resume_path: null
-task_name: XVLA
+task_name: XVLA_with_action
 
 action:
   num_layers: 6
@@ -39,7 +39,7 @@ data:
   eval_json_path: ./jsons/eval_XVLA.json
 
 train:
-  train_with_action: False
+  train_with_action: True
   gamma: 10
   dist: True
   epochs: 200

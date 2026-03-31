@@ -1,5 +1,7 @@
 #!/bin/bash
 
+rm -rf ckpts/debug logs/debug
+
 ROOT_DIR="logs"
 TOPK=1
 

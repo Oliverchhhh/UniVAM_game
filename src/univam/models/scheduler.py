@@ -122,7 +122,7 @@ class FlowMatchScheduler:
     def add_noise(self, original_samples, noise, timestep, timestep_id):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        sigma = self.sigmas[timestep_id].to(noise).view(noise.shape[0], 1, 1, 1, 1)
+        sigma = self.sigmas[timestep_id].to(noise).view(noise.shape[0], *([1] * (noise.ndim - 1)))
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
 

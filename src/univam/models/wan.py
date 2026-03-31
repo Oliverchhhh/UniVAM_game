@@ -489,8 +489,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         # fmt: on
 
         video_hidden_states = self.proj_out(video_hidden_states)
-        if action_hidden_states is not None:
-            action_hidden_states = self.proj_out(action_hidden_states)
         video_hidden_states = rearrange(
             video_hidden_states,
             "b (t h w) (c p1 p2 p3) -> b c (t p1) (h p2) (w p3)",
