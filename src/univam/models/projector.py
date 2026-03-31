@@ -16,6 +16,7 @@ class MLPProjector(nn.Module):
         self.hidden_dim: int = args.hidden_dim
         self.cross_attention_dim: int = args.cross_attention_dim
         self.output_align_dim: int = args.output_align_dim
+        self.num_attention_heads: int = args.num_attention_heads
 
         self.num_token: int = args.num_token
         self.num_attn_layers: int = args.num_attn_layers
@@ -45,8 +46,8 @@ class MLPProjector(nn.Module):
             [
                 BasicTransformerBlock(
                     dim=self.channels,
-                    num_attention_heads=8,
-                    attention_head_dim=self.channels // 8,
+                    num_attention_heads=self.num_attention_heads,
+                    attention_head_dim=self.channels // self.num_attention_heads,
                     dropout=0.1,
                     cross_attention_dim=self.channels,
                 )
@@ -57,8 +58,8 @@ class MLPProjector(nn.Module):
             [
                 BasicTransformerBlock(
                     dim=self.hidden_dim,
-                    num_attention_heads=8,
-                    attention_head_dim=self.cross_attention_dim // 8,
+                    num_attention_heads=self.num_attention_heads,
+                    attention_head_dim=self.cross_attention_dim // self.num_attention_heads,
                     dropout=0.1,
                     cross_attention_dim=self.cross_attention_dim,
                 )
@@ -153,6 +154,7 @@ class QformerProjector(nn.Module):
 
         self.num_query_token = args.num_token
         self.num_attn_layers = args.num_attn_layers
+        self.num_attention_heads = args.num_attention_heads
 
         self.query_tokens = nn.Parameter(torch.randn(1, self.num_query_token, self.hidden_dim))
 
@@ -160,7 +162,7 @@ class QformerProjector(nn.Module):
             [
                 QformerBlock(
                     dim=self.hidden_dim,
-                    num_heads=8,
+                    num_heads=self.num_attention_heads,
                     cross_dim=self.channels,
                 )
                 for _ in range(self.num_attn_layers)
@@ -195,28 +197,27 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    patches = 2 * 15 * 20
-    channels = 24 * 128
+    patches = 2 * 8 * 8
 
     if args.projector.type == "mlp":
         model = MLPProjector(
             args.projector,
             patches=patches,
-            channels=channels,
+            channels=args.projector.output_align_dim,
         ).to(device)
         print(f"Token compression process: {model.compress_dims}")
     elif args.projector.type == "qformer":
         model = QformerProjector(
             args.projector,
             patches=patches,
-            channels=channels,
+            channels=args.projector.output_align_dim,
         ).to(device)
     else:
         raise ValueError(f"Unknown projector type '{args.projector.type}'. ")
 
     batch_size = 2
 
-    video_pooler_feature = torch.randn(batch_size, patches, channels).to(device)
+    video_pooler_feature = torch.randn(batch_size, patches, args.projector.output_align_dim).to(device)
 
     compressed_embeds = model(video_pooler_feature)
 

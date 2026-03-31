@@ -37,17 +37,17 @@ class Wan22VisionActionModel(nn.Module):
             config.wanva.model_path,
             frames=config.data.frames,
         )
-        # self.vae_scale_factor_spatial = self.wanvae.vae.config.scale_factor_spatial
-        # self.vae_scale_factor_temporal = self.wanvae.vae.config.scale_factor_temporal
+        vae_hw = self.wanvae.vae.config.scale_factor_spatial
 
         height, width = config.data.image_size
         self.latent_t_num = self.wanvae.latent_t_num
         self.num_channels_latents = self.wanvae.vae.config.z_dim
 
-        self.vae_height = height // self.wanvae.vae.config.scale_factor_spatial
-        self.vae_width = width // self.wanvae.vae.config.scale_factor_spatial
+        self.vae_height = height // vae_hw
+        self.vae_width = width // vae_hw
 
         self.patch_size = config.wanva.patch_size
+        self.projector_patch_size = config.projector.patch_size
 
         self.transformer3d = WanTransformer3DModel.from_pretrained(
             config.wanva.model_path,
@@ -62,28 +62,32 @@ class Wan22VisionActionModel(nn.Module):
 
         self.patch_embedding = nn.Conv3d(
             self.wanvae.vae.config.z_dim,
-            self.transformer3d.inner_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
+            config.projector.output_align_dim,
+            kernel_size=self.projector_patch_size,
+            stride=self.projector_patch_size,
         )
 
-        patches = (
-            (self.latent_t_num // self.patch_size[0])
-            * (self.vae_height // self.patch_size[1])
-            * (self.vae_width // self.patch_size[2])
-        )
+        pt, ph, pw = self.projector_patch_size
+        wt, wh, ww = self.patch_size = config.wanva.patch_size
+        assert self.latent_t_num % (pt * wt) == 0, f"{self.latent_t_num=} must be divisible by {pt*wt=}"
+
+        assert height % (ph * vae_hw * wh) == 0, f"{height=} must be divisible by {ph*vae_hw*wh=}"
+
+        assert width % (pw * vae_hw * ww) == 0, f"{width=} must be divisible by {pw*vae_hw*ww=}"
+
+        vae_num_tokens = (self.latent_t_num // pt) * (self.vae_height // ph) * (self.vae_width // pw)
 
         if config.projector.type == "mlp":
             self.projector = MLPProjector(
                 config.projector,
-                patches=patches,
-                channels=self.transformer3d.inner_dim,
+                patches=vae_num_tokens,
+                channels=config.projector.output_align_dim,
             )
         elif config.projector.type == "qformer":
             self.projector = QformerProjector(
                 config.projector,
-                patches=patches,
-                channels=self.transformer3d.inner_dim,
+                patches=vae_num_tokens,
+                channels=config.projector.output_align_dim,
             )
         else:
             raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
