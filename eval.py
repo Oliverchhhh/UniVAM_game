@@ -16,12 +16,12 @@ from univam.utils.overwatch import initialize_overwatch
 overwatch = initialize_overwatch(__name__)
 
 
-def main(args):
+def main(args, vis_diff=False, scale=1):
     overwatch.info("Loading datasets...")
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    dtype = torch.bfloat16
 
     eval_dataloader = load_multi_datasets_form_json(
         args.data,
@@ -76,12 +76,19 @@ def main(args):
     ensure_directory(gt_video_path)
     ensure_directory(pred_video_path)
 
-    for i in range(pred_videos.shape[0]):
-        gt_np = (label_videos[i].permute(0, 2, 3, 1).float().cpu().numpy() * 255).astype(np.uint8)
-        pred_np = (pred_videos[i].permute(0, 2, 3, 1).float().cpu().numpy() * 255).astype(np.uint8)
+    if vis_diff:
+        diff_video_path = os.path.join(video_path, "diff")
+        ensure_directory(diff_video_path)
 
-        gt_frames = [Image.fromarray(frame) for frame in gt_np]
-        pred_frames = [Image.fromarray(frame) for frame in pred_np]
+    for i in range(pred_videos.shape[0]):
+        gt_np = label_videos[i].permute(0, 2, 3, 1).float().cpu().numpy()  # [T, H, W, C]
+        pred_np = pred_videos[i].permute(0, 2, 3, 1).float().cpu().numpy()
+
+        gt_uint8 = (gt_np * 255).clip(0, 255).astype(np.uint8)
+        pred_uint8 = (pred_np * 255).clip(0, 255).astype(np.uint8)
+
+        gt_frames = [Image.fromarray(frame) for frame in gt_uint8]
+        pred_frames = [Image.fromarray(frame) for frame in pred_uint8]
 
         widths, heights = zip(*(img.size for img in gt_frames))
         total_width = sum(widths)
@@ -93,9 +100,6 @@ def main(args):
             x_offset += img.size[0]
         gt_concat.save(os.path.join(gt_video_path, f"{i:02d}_gt_video.jpg"))
 
-        widths, heights = zip(*(img.size for img in pred_frames))
-        total_width = sum(widths)
-        max_height = max(heights)
         pred_concat = Image.new("RGB", (total_width, max_height))
         x_offset = 0
         for img in pred_frames:
@@ -105,16 +109,49 @@ def main(args):
 
         if pred_concat.size != gt_concat.size:
             pred_concat = pred_concat.resize(gt_concat.size)
+
+        if vis_diff:
+            diff_frames = []
+
+            for gt_frame, pred_frame in zip(gt_np, pred_np):
+                diff = np.abs(gt_frame - pred_frame)
+                diff_map = diff.mean(axis=-1)
+                diff_map = np.clip(diff_map * scale, 0, 1)
+
+                diff_map = (diff_map * 255).clip(0, 255).astype(np.uint8)
+
+                heatmap = np.zeros((*diff_map.shape, 3), dtype=np.uint8)
+                heatmap[..., 0] = diff_map
+
+                diff_frames.append(Image.fromarray(heatmap))
+
+            diff_concat = Image.new("RGB", (total_width, max_height))
+            x_offset = 0
+            for img in diff_frames:
+                diff_concat.paste(img, (x_offset, 0))
+                x_offset += img.size[0]
+
+            diff_concat.save(os.path.join(diff_video_path, f"{i:02d}_diff.jpg"))
+
         w, h = gt_concat.size
-        final_img = Image.new("RGB", (w, h * 2))
-        final_img.paste(gt_concat, (0, 0))
-        final_img.paste(pred_concat, (0, h))
+
+        if vis_diff:
+            final_img = Image.new("RGB", (w, h * 3))
+            final_img.paste(gt_concat, (0, 0))
+            final_img.paste(pred_concat, (0, h))
+            final_img.paste(diff_concat, (0, h * 2))
+        else:
+            final_img = Image.new("RGB", (w, h * 2))
+            final_img.paste(gt_concat, (0, 0))
+            final_img.paste(pred_concat, (0, h))
+
         final_img.save(os.path.join(video_path, f"{i:02d}.jpg"))
 
 
 if __name__ == "__main__":
     args = load_args()
-    args.image_size = [480, 640]
+    args.train.local_batch_size = 8
+    args.data.image_size = [512, 512]
     args.data.eval_json_path = os.environ.get("EVAL_JSON_PATH", args.data.eval_json_path)
     args.resume_path = os.environ.get("RESUME_PATH", args.resume_path)
-    main(args)
+    main(args, vis_diff=True, scale=1)

@@ -153,7 +153,7 @@ class Wan22VisionActionModel(nn.Module):
         self.wanvae.requires_grad_(False)
 
     def _save_ckpt(self, model_dict: Dict, projector_model_dict: Dict, save_path: str, global_step: int) -> None:
-        exclude_prefixes = ["wanvae", "projector", "video_feature_extractor"]
+        exclude_prefixes = ["wanvae", "projector"]
         save_dict = {"model": {}, "global_step": global_step}
         for k, v in model_dict.items():
             if not any(k.startswith(prefix) for prefix in exclude_prefixes):

@@ -15,3 +15,9 @@
    cd UniVAM && pip install -e .
    MAX_JOBS=4 python -m pip -v install flash-attn --no-build-isolation
    ```
+
+## Datasets
+
+- physical-intelligence/libero
+
+- 
