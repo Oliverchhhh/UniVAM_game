@@ -227,7 +227,7 @@ class InfiniteDistributedSampler(DistributedSampler):
 
 
 class InfiniteMultiTaskBatchSampler(BatchSampler):
-    def __init__(self, datasets, batch_size, sample_per_dataset, shuffle=True):
+    def __init__(self, datasets, batch_size, ratios, shuffle=True):
         """
         多任务批量采样器，支持 Lightning 的分布式模式。
         :param datasets: 多个数据集的列表
@@ -236,17 +236,15 @@ class InfiniteMultiTaskBatchSampler(BatchSampler):
         """
         self.datasets = datasets
         self.batch_size = batch_size
+        self.ratios = ratios
         self.num_datasets = len(self.datasets)
-        self.samples_per_dataset = sample_per_dataset
-        # self.remaining_samples = batch_size % self.num_datasets
+
+        self.credits = [0.0] * self.num_datasets
+
         self.dataset_lengths = [len(dataset) for dataset in self.datasets]
-
-        self.cumulative_sizes = [0] + self.dataset_lengths
-
-        for i in range(1, len(self.cumulative_sizes)):
-            self.cumulative_sizes[i] += self.cumulative_sizes[i - 1]
-
-        self.cur_idx = 0
+        self.cumulative_sizes = [0]
+        for l in self.dataset_lengths:
+            self.cumulative_sizes.append(self.cumulative_sizes[-1] + l)
 
         # 为每个数据集创建无限采样器
         self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -255,24 +253,56 @@ class InfiniteMultiTaskBatchSampler(BatchSampler):
             InfiniteDistributedSampler(dataset, num_replicas=self.num_replicas, rank=self.rank, shuffle=shuffle)
             for dataset in datasets
         ]
-        self.iterators = [iter(sampler) for sampler in self.samplers]
+        self.iterators = [iter(s) for s in self.samplers]
 
     def __iter__(self):
         """
         无限生成每个 batch 的样本索引。
         """
         while True:
+            # Step 1: 每个 batch 开始时，按 ratio 给每个数据集累加"应得配额"
+            for i, r in enumerate(self.ratios):
+                self.credits[i] += r * self.batch_size
+
+            # Step 2: 按 credits 从高到低贪心分配整数 slot
+            # 先取 floor，再用最大余数法分配剩余 slot
+            base = [math.floor(c) for c in self.credits]
+            slots_used = sum(base)
+
+            # batch_size 个 slot 全部由 credits 决定，不额外补
+            # 但 credits 的总和始终 == batch_size 的整数倍，所以 sum(base) 接近 batch_size
+            remainder = self.batch_size - slots_used
+
+            if remainder > 0:
+                # 按小数部分降序补齐
+                fractional = sorted(
+                    range(self.num_datasets), key=lambda i: -(self.credits[i] - math.floor(self.credits[i]))
+                )
+                for j in range(remainder):
+                    base[fractional[j]] += 1
+            elif remainder < 0:
+                # 极少数情况：credits 累积导致 sum(base) > batch_size，需减掉
+                fractional = sorted(
+                    range(self.num_datasets), key=lambda i: self.credits[i] - math.floor(self.credits[i])
+                )
+                for j in range(-remainder):
+                    base[fractional[j]] -= 1
+
+            # Step 3: 构造 batch，并从 credits 中扣除已使用的配额
             batch = []
-            for i in range(len(self.iterators)):
-                iterator = self.iterators[i]
-                for _ in range(self.samples_per_dataset[i]):
-                    batch.append(next(iterator) + self.cumulative_sizes[i])
+            for i, num in enumerate(base):
+                if num <= 0:
+                    continue
+                self.credits[i] -= num  # 扣除本次实际使用量
+                for _ in range(num):
+                    batch.append(next(self.iterators[i]) + self.cumulative_sizes[i])
+
             yield batch
 
     def __len__(self):
         return sum(self.dataset_lengths)
 
-
+# BUG
 class FiniteMultiTaskBatchSampler(BatchSampler):
     def __init__(self, datasets, batch_size, sample_per_dataset, drop_last=False, shuffle=True):
         self.datasets = datasets
@@ -368,6 +398,10 @@ def load_unsampler_datasets_from_json(
         from univam.utils.dataloaders.hdf5 import EpisodeData, collate_fn
 
         dataset = EpisodeData(config, orig_fps=24, flip_p=flip_p, eval_sample_num=eval_sample_num)
+    elif config.type == "lerobot":
+        from univam.utils.dataloaders.lerobot_ import ResampledLeRobotDataset, collate_fn
+
+        dataset = ResampledLeRobotDataset(config, eval_sample_num=eval_sample_num)
 
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
@@ -408,8 +442,8 @@ def load_unsampler_datasets_from_json(
 def load_multi_datasets_form_json(
     config,
     json_path,
-    flip_p,
     local_batch_size,
+    flip_p=0,
     num_workers=8,
     is_infinite=True,
     shuffle=True,
@@ -433,11 +467,19 @@ def load_multi_datasets_form_json(
     if config.type == "video":
         from univam.utils.dataloaders.video import VideoData, collate_fn
 
-        dataset = VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)
+        DatasetClass = lambda: VideoData(config, flip_p=flip_p, eval_sample_num=eval_sample_num)  # noqa: E731
     elif config.type == "hdf5":
         from univam.utils.dataloaders.hdf5 import EpisodeData, collate_fn
 
-        dataset = EpisodeData(config, orig_fps=24, flip_p=flip_p, eval_sample_num=eval_sample_num)
+        DatasetClass = lambda: EpisodeData(config, orig_fps=24, flip_p=flip_p, eval_sample_num=eval_sample_num)  # noqa: E731
+    elif config.type == "lerobot":
+        from univam.utils.dataloaders.lerobot_ import ResampledLeRobotDataset, collate_fn
+
+        DatasetClass = lambda: ResampledLeRobotDataset(  # noqa: E731
+            config,
+            eval_sample_num=eval_sample_num,
+            action_chunk_size=1,
+        )
 
     with open(json_path, "r") as f:
         meta_infos = json.load(f)
@@ -451,26 +493,18 @@ def load_multi_datasets_form_json(
 
     for dataset_path in dataset_paths:
         dataset_path = os.path.join(os.path.dirname(json_path), dataset_path)
+        dataset = DatasetClass()
         dataset.add(dataset_path)
         datasets.append(dataset)
-
-    sample_per_dataset = [max(1, math.floor(r * local_batch_size)) for r in ratios]
-
-    total = sum(sample_per_dataset)
-    if total < local_batch_size:
-        sample_per_dataset[-1] += local_batch_size - total
-    elif total > local_batch_size:
-        sample_per_dataset[-1] -= total - local_batch_size
 
     wrapped_dataset = MultiDatasetWrapper(datasets)
 
     if is_infinite:
-        batch_sampler = InfiniteMultiTaskBatchSampler(
-            datasets, local_batch_size, sample_per_dataset=sample_per_dataset, shuffle=shuffle
-        )
+        batch_sampler = InfiniteMultiTaskBatchSampler(datasets, local_batch_size, ratios=ratios, shuffle=shuffle)
     else:
+        # BUG
         batch_sampler = FiniteMultiTaskBatchSampler(
-            datasets, local_batch_size, sample_per_dataset=sample_per_dataset, shuffle=shuffle, drop_last=drop_last
+            datasets, local_batch_size, ratios=ratios, shuffle=shuffle, drop_last=drop_last
         )
 
     dataloader = DataLoader(
@@ -496,7 +530,7 @@ if __name__ == "__main__":
         flip_p=0,
         local_batch_size=32,
         num_workers=0,
-        is_infinite=False,
+        is_infinite=True,
         shuffle=False,
         drop_last=False,
         make_single_dataset=True,
