@@ -3,7 +3,7 @@ do_train: True
 log_dir: logs
 resume: False
 resume_path: null
-task_name: debug
+task_name: sim
 
 action:
   num_layers: 6
@@ -35,21 +35,21 @@ data:
   frames: 5
   num_workers: 16
   image_size: [512, 512]
-  train_json_path: ./jsons/train_debug.json
-  eval_json_path: ./jsons/eval_debug.json
+  train_json_path: ./jsons/train_sim.json
+  eval_json_path: ./jsons/eval_sim.json
 
 train:
-  train_with_action: True
+  train_with_action: False
   gamma: 10
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 20
-  save_step: 20
-  local_batch_size: 8
-  eval_sample_num: 4
+  eval_step: 2500
+  save_step: 2500
+  local_batch_size: 16
+  eval_sample_num: 2
   learning_rate: 3e-5
-  warmup_ratio: 0.01
+  warmup_ratio: 0.0001
   decay: 1e-3
   ckpt_save_dir: ckpts
-  gradient_accumulate_steps: 2
+  gradient_accumulate_steps: 1

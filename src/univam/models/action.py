@@ -152,8 +152,7 @@ class ActionDecoder(nn.Module):
 
 if __name__ == "__main__":
     from univam.utils.args import load_args
-    from univam.utils.data import set_seed
-    from univam.utils.dataloaders.hdf5 import EpisodeData
+    from univam.utils.data import load_multi_datasets_form_json, set_seed
 
     args = load_args()
     set_seed(args.seed)
@@ -165,15 +164,22 @@ if __name__ == "__main__":
     hidden_dim = 3072
 
     # get real data via Dataset
-    data = EpisodeData(args.data, 24)
-    data.video_paths = ["tests/examples/sample_episode.hdf5"]
-    data.dataset_name = ["XVLA"]
-    video, action, timestep = data.read_episode(0, 0)
+    eval_dataloader = load_multi_datasets_form_json(
+        args.data,
+        json_path=args.data.eval_json_path,
+        local_batch_size=batch_size,
+        num_workers=0,
+        is_infinite=False,
+        shuffle=False,
+        drop_last=False,
+        eval_sample_num=args.train.eval_sample_num,
+        make_single_dataset=True,
+    )
+    data = next(iter(eval_dataloader))
 
-    video = video.unsqueeze(0)
-    videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
-    action = action.unsqueeze(0)
-    actions = torch.cat([action] * batch_size, dim=0).to(device=device, dtype=dtype)
+    videos = data["videos"]
+    actions = data["actions"]
+
     actions = actions.reshape(batch_size, -1, actions.shape[-1])
     actions = actions[:, :-1, :]
 

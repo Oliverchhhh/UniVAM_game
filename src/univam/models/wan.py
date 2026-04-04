@@ -558,8 +558,7 @@ def test_transformer3d(args, video_latents, device, dtype, action_latents=None):
 
 if __name__ == "__main__":
     from univam.utils.args import load_args
-    from univam.utils.data import set_seed
-    from univam.utils.dataloaders.video import VideoData
+    from univam.utils.data import load_multi_datasets_form_json, set_seed
 
     args = load_args()
     set_seed(args.seed)
@@ -570,11 +569,19 @@ if __name__ == "__main__":
     batch_size = 2
 
     # get real data via Dataset
-    data = VideoData(args.data)
-    data.video_paths = ["tests/examples/lingbot.mp4"]
-    video = data.read_video_decord(0, 0)
-    video = video.unsqueeze(0)
-    videos = torch.cat([video] * batch_size, dim=0).to(device=device, dtype=dtype)
+    eval_dataloader = load_multi_datasets_form_json(
+        args.data,
+        json_path=args.data.eval_json_path,
+        local_batch_size=batch_size,
+        num_workers=0,
+        is_infinite=False,
+        shuffle=False,
+        drop_last=False,
+        eval_sample_num=args.train.eval_sample_num,
+        make_single_dataset=True,
+    )
+    data = next(iter(eval_dataloader))
+    videos = data["videos"]
 
     action_latents = torch.randn((batch_size, 4, 3072))
 
