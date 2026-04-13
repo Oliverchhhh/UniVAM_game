@@ -1,8 +1,8 @@
 seed: 33
 do_train: True
 log_dir: logs
-resume: False
-resume_path: null
+resume: True
+resume_path: ckpts/sim/150000
 task_name: sim
 
 action:

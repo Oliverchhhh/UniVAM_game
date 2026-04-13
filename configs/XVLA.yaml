@@ -3,7 +3,7 @@ do_train: True
 log_dir: logs
 resume: False
 resume_path: null
-task_name: XVLA
+task_name: XVLA_2token
 
 action:
   num_layers: 6
@@ -12,7 +12,7 @@ action:
 
 projector:
   type: qformer # mlp | qformer
-  num_token: 8
+  num_token: 2
   num_attn_layers: 6
   num_attn_compress_layers: 6
   num_attention_heads: 8

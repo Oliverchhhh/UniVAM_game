@@ -3,8 +3,8 @@ k ?= 1
 
 .PHONY: quality style clean
 
-check_dirs := src scripts train.py eval.py download_models.py download_datasets.py
-exclude_dirs := tests,scripts/datasets/download_robotwin.py
+check_dirs := src scripts tests/code train.py eval.py download_models.py download_datasets.py
+exclude_dirs := tests/examples,scripts/datasets/download_robotwin.py
 
 quality:
 	ruff check $(check_dirs) --exclude $(exclude_dirs)

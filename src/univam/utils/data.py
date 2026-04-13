@@ -302,6 +302,7 @@ class InfiniteMultiTaskBatchSampler(BatchSampler):
     def __len__(self):
         return sum(self.dataset_lengths)
 
+
 # BUG
 class FiniteMultiTaskBatchSampler(BatchSampler):
     def __init__(self, datasets, batch_size, sample_per_dataset, drop_last=False, shuffle=True):
