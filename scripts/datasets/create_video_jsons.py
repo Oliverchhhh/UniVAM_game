@@ -111,11 +111,11 @@ if __name__ == "__main__":
     dataset_path = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
     train_video_dirs = [
-        dataset_path / "XVLA-Soft-Fold-Videos/train",
+        dataset_path / "physical-intelligence/libero_videos/train",
     ]
 
     eval_video_dirs = [
-        dataset_path / "XVLA-Soft-Fold-Videos/eval",
+        dataset_path / "physical-intelligence/libero_videos/eval",
     ]
 
-    create_split_jsonl(train_video_dirs, eval_video_dirs, "XVLA", shared_train_num=1, eval_num=1)
+    create_split_jsonl(train_video_dirs, eval_video_dirs, "libero", shared_train_num=1, eval_num=1)

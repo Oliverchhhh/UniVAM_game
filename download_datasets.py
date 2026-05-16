@@ -10,14 +10,7 @@ load_dotenv()
 local_dir = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
 repo_ids = [
-    "lerobot/libero_spatial_image",
-    "lerobot/libero_object_image",
-    "lerobot/libero_goal_image",
-    "lerobot/libero_10_image",
-    "hxma/RoboTwin-LeRobot-v3.0",
-    "iAyoD/robocasa_mobile_turn_on_microwave_256_hybrid",
-    "iAyoD/robocasa_mobile_close_drawer_256_hybrid",
-    "iAyoD/robocasa_mobile_close_single_door_256_hybrid",
+    "physical-intelligence/libero",
 ]
 
 for repo_id in repo_ids:

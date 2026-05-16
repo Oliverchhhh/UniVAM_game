@@ -53,11 +53,12 @@ class Wan22VisionModel(nn.Module):
             subfolder="transformer",
             patch_size=config.wanva.patch_size,
             num_attention_heads=config.wanva.num_attention_heads,
-            video_dim=config.projector.output_align_dim,
-            low_cpu_mem_usage=False,
+            text_dim=config.projector.output_align_dim,
+            low_cpu_mem_usage=True,
             ignore_mismatched_sizes=True,
         )
-        self.transformer3d.init_weights()
+        self.transformer3d.init_weights()  # also materializes meta params from custom modules
+        # self.transformer3d.enable_gradient_checkpointing() # 没什么大用
 
         self.patch_embedding = nn.Conv3d(
             self.wanvae.vae.config.z_dim,
@@ -252,10 +253,10 @@ class Wan22VisionModel(nn.Module):
         video_target = self.video_scheduler.training_target(video_latents, video_noise, video_timesteps)
 
         video_pred_latents = self.transformer3d(
-            video_timestep=video_timesteps,
-            video_hidden_states=video_noisy_latents,
+            timestep=video_timesteps,
+            hidden_states=video_noisy_latents,
             encoder_hidden_states=video_embeds,
-        )
+        ).sample
         check_tensor(video_pred_latents, "video_pred_latents", check_bound=100, check_std=10)
 
         video_loss = self.video_scheduler.calculate_loss(
@@ -296,10 +297,10 @@ class Wan22VisionModel(nn.Module):
 
                 timestep = t.expand(video_latent_input.shape[0])
                 video_noise_pred = self.transformer3d(
-                    video_timestep=timestep,
-                    video_hidden_states=video_latent_input,
+                    timestep=timestep,
+                    hidden_states=video_latent_input,
                     encoder_hidden_states=video_embeds,
-                )
+                ).sample
 
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = video_noise_pred.chunk(2)

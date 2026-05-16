@@ -1,16 +1,19 @@
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers import AutoencoderKLWan
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.attention import FeedForward
+from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
+from diffusers.models.attention import AttentionMixin, FeedForward
+from diffusers.models.cache_utils import CacheMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
-from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor, WanRotaryPosEmbed
-from einops import rearrange
+from diffusers.models.transformers.transformer_wan import WanRotaryPosEmbed, WanTransformerBlock
+from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 
 from univam.utils.overwatch import initialize_overwatch
 
@@ -138,148 +141,61 @@ class TimeVideoEmbedding(nn.Module):
 
     def forward(
         self,
-        video_timestep: torch.Tensor,
+        timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        timestep_seq_len: Optional[int] = None,
     ):
-        video_timestep = self.timesteps_proj(video_timestep)
+        timestep = self.timesteps_proj(timestep)
+        if timestep_seq_len is not None:
+            timestep = timestep.unflatten(0, (-1, timestep_seq_len))
 
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
-        if video_timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
-            video_timestep = video_timestep.to(time_embedder_dtype)
+        if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
+            timestep = timestep.to(time_embedder_dtype)
 
-        video_temb = self.time_embedder(video_timestep).type_as(encoder_hidden_states)
-        video_timestep_proj = self.time_proj(self.act_fn(video_temb))
+        temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
+        timestep_proj = self.time_proj(self.act_fn(temb))
 
         encoder_hidden_states = self.video_embedder(encoder_hidden_states)
 
-        return video_temb, video_timestep_proj, encoder_hidden_states
+        return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
-class WanTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        ffn_dim: int,
-        num_heads: int,
-        qk_norm: str = "rms_norm_across_heads",
-        cross_attn_norm: bool = False,
-        eps: float = 1e-6,
-        added_kv_proj_dim: int | None = None,
-    ):
-        super().__init__()
+class WanTransformer3DModel(
+    ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin, AttentionMixin
+):
+    _supports_gradient_checkpointing = True
+    _skip_layerwise_casting_patterns = ["patch_embedding", "condition_embedder", "norm"]
+    _no_split_modules = ["WanTransformerBlock"]
+    _keep_in_fp32_modules = ["time_embedder", "scale_shift_table", "norm1", "norm2", "norm3"]
+    _keys_to_ignore_on_load_unexpected = ["norm_added_q"]
+    _repeated_blocks = ["WanTransformerBlock"]
 
-        # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.attn1 = WanAttention(
-            dim=dim,
-            heads=num_heads,
-            dim_head=dim // num_heads,
-            eps=eps,
-            cross_attention_dim_head=None,
-            processor=WanAttnProcessor(),
-        )
-
-        # 2. Cross-attention
-        self.attn2 = WanAttention(
-            dim=dim,
-            heads=num_heads,
-            dim_head=dim // num_heads,
-            eps=eps,
-            added_kv_proj_dim=added_kv_proj_dim,
-            cross_attention_dim_head=dim // num_heads,
-            processor=WanAttnProcessor(),
-        )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-
-        # 3. Feed-forward
-        self.ffn = FeedForward(dim, inner_dim=ffn_dim, activation_fn="gelu-approximate")
-        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-
-    def forward(
-        self,
-        video_hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        rotary_emb: torch.Tensor,
-        video_temb: torch.Tensor,
-    ) -> torch.Tensor:
-        # fmt: off
-        if video_temb.ndim == 4:
-            # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
-            (
-                video_shift_msa,
-                video_scale_msa,
-                video_gate_msa,
-                video_c_shift_msa,
-                video_c_scale_msa,
-                video_c_gate_msa,
-            ) = self.scale_shift_table.unsqueeze(0) + video_temb.float().chunk(6, dim=2)
-            # batch_size, seq_len, 1, inner_dim
-            video_shift_msa = video_shift_msa.squeeze(2)
-            video_scale_msa = video_scale_msa.squeeze(2)
-            video_gate_msa = video_gate_msa.squeeze(2)
-            video_c_shift_msa = video_c_shift_msa.squeeze(2)
-            video_c_scale_msa = video_c_scale_msa.squeeze(2)
-            video_c_gate_msa = video_c_gate_msa.squeeze(2)
-        else:
-            # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
-            (
-                video_shift_msa,
-                video_scale_msa,
-                video_gate_msa,
-                video_c_shift_msa,
-                video_c_scale_msa,
-                video_c_gate_msa,
-            ) = (self.scale_shift_table + video_temb.float()).chunk(6, dim=1)
-
-        # 1. Self-attention
-        norm_hidden_states = (self.norm1(video_hidden_states.float()) * (1 + video_scale_msa) + video_shift_msa).type_as(video_hidden_states)
-
-        attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
-
-        video_hidden_states = (video_hidden_states.float() + attn_output * video_gate_msa).type_as(video_hidden_states)
-
-        # 2. Cross-attention
-        norm_hidden_states = self.norm2(video_hidden_states.float()).type_as(video_hidden_states)
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
-        video_hidden_states = video_hidden_states + attn_output
-
-        # 3. Feed-forward
-        video_norm_hidden_states = (self.norm3(video_hidden_states.float()) * (1 + video_c_scale_msa) + video_c_shift_msa).type_as(video_hidden_states)
-        video_ff_output = self.ffn(video_norm_hidden_states)
-        video_hidden_states = (video_hidden_states.float() + video_ff_output.float() * video_c_gate_msa).type_as(video_hidden_states)
-        # fmt: on
-
-        return video_hidden_states
-
-
-class WanTransformer3DModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        patch_size: Tuple[int, ...] = (1, 2, 2),
-        num_attention_heads: int = 24,
+        patch_size: Tuple[int] = (1, 2, 2),
+        num_attention_heads: int = 40,
         attention_head_dim: int = 128,
-        in_channels: int = 48,
-        out_channels: int = 48,
-        video_dim: int = 4096,
+        in_channels: int = 16,
+        out_channels: int = 16,
+        text_dim: int = 4096,
         freq_dim: int = 256,
-        ffn_dim: int = 14336,
-        num_layers: int = 30,
+        ffn_dim: int = 13824,
+        num_layers: int = 40,
         cross_attn_norm: bool = True,
         qk_norm: Optional[str] = "rms_norm_across_heads",
         eps: float = 1e-6,
+        image_dim: Optional[int] = None,
         added_kv_proj_dim: Optional[int] = None,
-        rope_max_seq_len=1024,
-    ):
+        rope_max_seq_len: int = 1024,
+        pos_embed_seq_len: Optional[int] = None,
+    ) -> None:
         super().__init__()
 
-        self.patch_size = patch_size
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
-        self.inner_dim = inner_dim
+        out_channels = out_channels or in_channels
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -290,7 +206,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             dim=inner_dim,
             time_freq_dim=freq_dim,
             time_proj_dim=inner_dim * 6,
-            video_embed_dim=video_dim,
+            video_embed_dim=text_dim,
         )
 
         # 3. Transformer blocks
@@ -308,99 +224,148 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
+        self.gradient_checkpointing = False
+
     def init_weights(self) -> None:
+        # 1. Materialize and initialize meta params from custom modules not in checkpoint
+        for name, module in self.named_modules():
+            has_meta = any(
+                p.device.type == "meta" for p in module.parameters(recurse=False)
+            )
+            if not has_meta:
+                continue
+
+            module.to_empty(device=torch.device("cpu"))
+            overwatch.warning(f"Materializing meta module: {name}")
+
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv3d):
+                nn.init.xavier_uniform_(module.weight.flatten(1))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # 2. Reinitialize NaN params from corrupted checkpoint weights
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear) and torch.isnan(module.weight).any():
-                overwatch.warning(f"Reinitializing: {name}")
+                overwatch.warning(f"Reinitializing NaN: {name}")
                 nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
         if torch.isnan(self.patch_embedding.weight).any():
-            overwatch.warning("Reinitializing: patch_embedding")
+            overwatch.warning("Reinitializing NaN: patch_embedding")
             nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
             nn.init.zeros_(self.patch_embedding.bias)
 
+        # 3. Final safety check
         for name, param in self.named_parameters():
-            if torch.isnan(param).any():
+            if param.device.type == "meta":
+                overwatch.error(f"Meta param still not materialized: {name}")
+            elif torch.isnan(param).any():
                 overwatch.error(f"NaN param: {name}, {param.shape}, {param.device}")
 
     def forward(
         self,
-        video_timestep: torch.Tensor,
-        video_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
         encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        B, C, T, H, W = video_hidden_states.shape
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            lora_scale = 1.0
 
-        p_t, p_h, p_w = self.patch_size
-        post_patch_num_frames = T // p_t
-        post_patch_height = H // p_h
-        post_patch_width = W // p_w
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                overwatch.warning(
+                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                )
 
-        rotary_emb = self.rope(video_hidden_states)
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
 
-        video_hidden_states = self.patch_embedding(video_hidden_states)
-        video_hidden_states = video_hidden_states.flatten(2).transpose(1, 2)
+        rotary_emb = self.rope(hidden_states)
+
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
-        if video_timestep.ndim == 2:
-            ts_seq_len = video_timestep.shape[1]
-            video_timestep = video_timestep.flatten()  # batch_size * seq_len
+        if timestep.ndim == 2:
+            ts_seq_len = timestep.shape[1]
+            timestep = timestep.flatten()  # batch_size * seq_len
         else:
             ts_seq_len = None
 
-        video_temb, video_timestep_proj, encoder_hidden_states = (
-            self.condition_embedder(
-                video_timestep=video_timestep,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
         )
-
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim
-            video_timestep_proj = video_timestep_proj.unflatten(2, (6, -1))
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
         else:
             # batch_size, 6, inner_dim
-            video_timestep_proj = video_timestep_proj.unflatten(1, (6, -1))
+            timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
-        for block in self.blocks:
-            video_hidden_states = block(
-                video_hidden_states=video_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                rotary_emb=rotary_emb,
-                video_temb=video_timestep_proj,
-            )
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-        # fmt: off
-        if video_temb.ndim == 3:
+        # 4. Transformer blocks
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block in self.blocks:
+                hidden_states = self._gradient_checkpointing_func(
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                )
+        else:
+            for block in self.blocks:
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+
+        # 5. Output norm, projection & unpatchify
+        if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
-            video_shift, video_scale = (self.scale_shift_table.unsqueeze(0).to(video_temb.device) + video_temb.unsqueeze(2)).chunk(2, dim=2)
-            video_shift = video_shift.squeeze(2)
-            video_scale = video_scale.squeeze(2)
+            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
         else:
             # batch_size, inner_dim
-            video_shift, video_scale = (self.scale_shift_table.to(video_temb.device) + video_temb.unsqueeze(1)).chunk(2, dim=1)
+            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
 
-        video_shift = video_shift.to(video_hidden_states.device)
-        video_scale = video_scale.to(video_hidden_states.device)
+        shift = shift.to(hidden_states.device)
+        scale = scale.to(hidden_states.device)
 
-        video_hidden_states = (self.norm_out(video_hidden_states.float()) * (1.0 + video_scale) + video_shift).type_as(video_hidden_states)
-        # fmt: on
+        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.proj_out(hidden_states)
 
-        video_hidden_states = self.proj_out(video_hidden_states)
-        video_hidden_states = rearrange(
-            video_hidden_states,
-            "b (t h w) (c p1 p2 p3) -> b c (t p1) (h p2) (w p3)",
-            t=post_patch_num_frames,
-            h=post_patch_height,
-            w=post_patch_width,
-            p1=p_t,
-            p2=p_h,
-            p3=p_w,
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
         )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
-        return video_hidden_states
+        if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
+            unscale_lora_layers(self, lora_scale)
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
 
 
 def test_wanvae(args, videos, device, dtype):
@@ -426,8 +391,8 @@ def test_transformer3d(args, video_latents, device, dtype):
         subfolder="transformer",
         patch_size=args.wanva.patch_size,
         num_attention_heads=args.wanva.num_attention_heads,
-        video_dim=args.projector.output_align_dim,
-        low_cpu_mem_usage=False,
+        text_dim=args.projector.output_align_dim,
+        low_cpu_mem_usage=True,
         ignore_mismatched_sizes=True,
         output_loading_info=True,
     )
@@ -441,10 +406,10 @@ def test_transformer3d(args, video_latents, device, dtype):
     )
 
     video_hidden_states = transformer3d(
-        video_timestep=timestep,
-        video_hidden_states=video_latents,
+        timestep=timestep,
+        hidden_states=video_latents,
         encoder_hidden_states=encoder_hidden_states,
-    )
+    ).sample
 
     print(f"video_hidden_states.shape: {video_hidden_states.shape}")
 

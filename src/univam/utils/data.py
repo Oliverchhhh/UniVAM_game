@@ -520,6 +520,11 @@ def load_multi_datasets_form_json(
 
 
 if __name__ == "__main__":
+    import os
+
+    import numpy as np
+    from PIL import Image
+
     from univam.utils.args import load_args
 
     args = load_args()
@@ -541,3 +546,29 @@ if __name__ == "__main__":
 
     print(f"Dataloader length (Batches): {len(dataloader)}")
     print(f"Video shape: {data['videos'].shape}")
+
+    # Save first sample's frames concatenated horizontally
+    save_dir = "tests/datas/"
+    os.makedirs(save_dir, exist_ok=True)
+
+    sample = data["videos"][0]  # [T, C, H, W]
+    if sample.device.type != "cpu":
+        sample = sample.cpu()
+    sample = sample.numpy()
+
+    # Normalize: handle [-1,1] or [0,1] float, or [0,255] uint8
+    if sample.dtype == np.float32 or sample.dtype == np.float64:
+        if sample.min() < 0:
+            sample = (sample + 1.0) / 2.0
+        sample = (sample * 255).clip(0, 255).astype(np.uint8)
+
+    # [T, C, H, W] -> [T, H, W, C]
+    sample = sample.transpose(0, 2, 3, 1)
+
+    # Concatenate all frames horizontally: [H, T*W, C]
+    concat = np.concatenate([sample[i] for i in range(sample.shape[0])], axis=1)
+
+    img = Image.fromarray(concat)
+    save_path = os.path.join(save_dir, "sample_frames.png")
+    img.save(save_path)
+    print(f"Saved concatenated frames ({sample.shape[0]} frames) to {save_path}")
