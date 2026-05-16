@@ -150,7 +150,8 @@ def main(args, vis_diff=False, scale=1):
 
 if __name__ == "__main__":
     args = load_args()
-    args.train.local_batch_size = 8
+    args.train.local_batch_size = 16
+    args.train.eval_sample_num = 32
     args.data.image_size = [512, 512]
     args.data.eval_json_path = os.environ.get("EVAL_JSON_PATH", args.data.eval_json_path)
     args.resume_path = os.environ.get("RESUME_PATH", args.resume_path)
