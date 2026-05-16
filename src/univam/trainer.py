@@ -151,12 +151,21 @@ class Trainer:
         overwatch.warning(f"Saving models to {save_path}")
 
         self.accelerator.wait_for_everyone()
-        # get_state_dict is a collective operation; all ranks must participate
-        model_dict = self.accelerator.get_state_dict(self.model)
-        projector_model_dict = self.accelerator.get_state_dict(self.model.projector)
+        # get_state_dict is a collective operation; all ranks must participate.
+        # With ZeRO-3 it may return None on non-zero ranks.
+        full_state_dict = self.accelerator.get_state_dict(self.model)
+        model_dict = {}
+        projector_dict = {}
+        if full_state_dict is not None:
+            for k, v in full_state_dict.items():
+                if k.startswith("projector."):
+                    projector_dict[k[len("projector."):]] = v
+                else:
+                    model_dict[k] = v
+
         if overwatch.is_rank_zero():
             ensure_directory(save_path)
-            self.model._save_ckpt(model_dict, projector_model_dict, save_path, self.global_step)
+            self.model._save_ckpt(model_dict, projector_dict, save_path, self.global_step)
 
     def load_checkpoint(self, load_path) -> None:
         global_step = self.model._load_ckpt(load_path)

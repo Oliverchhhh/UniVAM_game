@@ -74,6 +74,9 @@ class WanVAE(nn.Module):
         """
         videos = self.align_video(videos)
         videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+        # Align input dtype with VAE (may differ when VAE is outside ZeRO module tree)
+        vae_dtype = self.latent_mean.dtype
+        videos = videos.to(dtype=vae_dtype)
         video_latents = self.vae.encode(videos).latent_dist.sample()
 
         mean = self.latent_mean.to(video_latents.dtype)
@@ -90,6 +93,10 @@ class WanVAE(nn.Module):
         Returns:
             videos: [B, T, C, H, W]
         """
+        # Align input dtype with VAE
+        vae_dtype = self.latent_mean.dtype
+        video_latents = video_latents.to(dtype=vae_dtype)
+
         mean = self.latent_mean.to(video_latents.dtype)
         std = self.latent_std.to(video_latents.dtype)
 

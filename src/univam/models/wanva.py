@@ -33,10 +33,13 @@ class Wan22VisionModel(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
 
-        self.wanvae = WanVAE(
+        # Keep VAE out of nn.Module tree so ZeRO-3 won't partition it.
+        # Its internal temporal feature caching is incompatible with parameter sharding.
+        wanvae = WanVAE(
             config.wanva.model_path,
             frames=config.data.frames,
         )
+        self.__dict__["wanvae"] = wanvae  # bypass nn.Module.__setattr__
         vae_hw = self.wanvae.vae.config.scale_factor_spatial
 
         height, width = config.data.image_size
@@ -116,6 +119,7 @@ class Wan22VisionModel(nn.Module):
 
     def to(self, *args, **kwargs):
         model_converted = super().to(*args, **kwargs)
+        self.wanvae.to(*args, **kwargs)  # VAE is not a registered submodule
         self.device = next(self.parameters()).device
         self.dtype = next(self.transformer3d.parameters()).dtype
         return model_converted

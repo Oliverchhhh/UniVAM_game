@@ -1,0 +1,12 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+use_cpu: false
+num_processes: 8
+num_machines: 1
+
+
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  deepspeed_config_file: configs/accelerate/ds_zero3.json
+  zero3_init_flag: false
