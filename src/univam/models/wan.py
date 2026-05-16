@@ -113,7 +113,7 @@ class VideoEmbedding(nn.Module):
         return hidden_states
 
 
-class TimeVideoActionEmbedding(nn.Module):
+class TimeVideoEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -124,15 +124,12 @@ class TimeVideoActionEmbedding(nn.Module):
         super().__init__()
 
         self.timesteps_proj = Timesteps(num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.action_timesteps_proj = Timesteps(num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
 
         self.time_embedder = TimestepEmbedding(in_channels=time_freq_dim, time_embed_dim=dim)
-        self.action_time_embedder = TimestepEmbedding(in_channels=time_freq_dim, time_embed_dim=dim)
 
         self.act_fn = nn.SiLU()
 
         self.time_proj = nn.Linear(dim, time_proj_dim)
-        self.action_time_proj = nn.Linear(dim, time_proj_dim)
 
         self.video_embedder = VideoEmbedding(
             in_features=video_embed_dim,
@@ -143,8 +140,6 @@ class TimeVideoActionEmbedding(nn.Module):
         self,
         video_timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        action_timestep: Optional[torch.Tensor] = None,
-        timestep_seq_len: Optional[int] = None,
     ):
         video_timestep = self.timesteps_proj(video_timestep)
 
@@ -157,18 +152,7 @@ class TimeVideoActionEmbedding(nn.Module):
 
         encoder_hidden_states = self.video_embedder(encoder_hidden_states)
 
-        action_temb = None
-        action_timestep_proj = None
-        if action_timestep is not None:
-            action_timestep = self.action_timesteps_proj(action_timestep)
-
-            if action_timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
-                action_timestep = action_timestep.to(time_embedder_dtype)
-
-            action_temb = self.action_time_embedder(action_timestep).type_as(encoder_hidden_states)
-            action_timestep_proj = self.action_time_proj(self.act_fn(action_temb))
-
-        return video_temb, video_timestep_proj, action_temb, action_timestep_proj, encoder_hidden_states
+        return video_temb, video_timestep_proj, encoder_hidden_states
 
 
 class WanTransformerBlock(nn.Module):
@@ -212,7 +196,6 @@ class WanTransformerBlock(nn.Module):
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        self.action_scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(
         self,
@@ -220,8 +203,6 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         rotary_emb: torch.Tensor,
         video_temb: torch.Tensor,
-        action_hidden_states: Optional[torch.Tensor] = None,
-        action_temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # fmt: off
         if video_temb.ndim == 4:
@@ -251,57 +232,26 @@ class WanTransformerBlock(nn.Module):
                 video_c_scale_msa,
                 video_c_gate_msa,
             ) = (self.scale_shift_table + video_temb.float()).chunk(6, dim=1)
-        if action_temb is not None:
-            (
-                action_shift_msa,
-                action_scale_msa,
-                action_gate_msa,
-                action_c_shift_msa,
-                action_c_scale_msa,
-                action_c_gate_msa,
-            ) = (self.action_scale_shift_table + action_temb.float()).chunk(6, dim=1)
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(video_hidden_states.float()) * (1 + video_scale_msa) + video_shift_msa).type_as(video_hidden_states)
-        if action_hidden_states is not None:
-            action_tokens = action_hidden_states.shape[1]
-            action_norm_hidden_states = (self.norm1(action_hidden_states.float()) * (1 + action_scale_msa) + action_shift_msa).type_as(action_hidden_states)
-            norm_hidden_states = torch.cat([norm_hidden_states, action_norm_hidden_states], dim=1)
 
         attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
 
-        if action_hidden_states is None:
-            video_hidden_states = (video_hidden_states.float() + attn_output * video_gate_msa).type_as(video_hidden_states)
-            hidden_states = video_hidden_states
-        else:
-            video_attn_output = attn_output[:, :-action_tokens, :]
-            action_attn_output = attn_output[:, -action_tokens:, :]
-            video_hidden_states = (video_hidden_states.float() + video_attn_output * video_gate_msa).type_as(video_hidden_states)
-            action_hidden_states = (action_hidden_states.float() + action_attn_output * action_gate_msa).type_as(action_hidden_states)
-            hidden_states = torch.cat([video_hidden_states, action_hidden_states], dim=1)
+        video_hidden_states = (video_hidden_states.float() + attn_output * video_gate_msa).type_as(video_hidden_states)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden_states = self.norm2(video_hidden_states.float()).type_as(video_hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
-        hidden_states = hidden_states + attn_output
+        video_hidden_states = video_hidden_states + attn_output
 
         # 3. Feed-forward
-        if action_hidden_states is None:
-            video_norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + video_c_scale_msa) + video_c_shift_msa).type_as(hidden_states)
-            video_ff_output = self.ffn(video_norm_hidden_states)
-            video_hidden_states = (hidden_states.float() + video_ff_output.float() * video_c_gate_msa).type_as(video_hidden_states)
-        else:
-            video_hidden_states = hidden_states[:, :-action_tokens, :]
-            action_hidden_states = hidden_states[:, -action_tokens:, :]
-            video_norm_hidden_states = (self.norm3(video_hidden_states.float()) * (1 + video_c_scale_msa) + video_c_shift_msa).type_as(video_hidden_states)
-            action_norm_hidden_states = (self.norm3(action_hidden_states.float()) * (1 + action_c_scale_msa) + action_c_shift_msa).type_as(action_hidden_states)
-            video_ff_output = self.ffn(video_norm_hidden_states)
-            action_ff_output = self.ffn(action_norm_hidden_states)
-            video_hidden_states = (video_hidden_states.float() + video_ff_output.float() * video_c_gate_msa).type_as(video_hidden_states)
-            action_hidden_states = (action_hidden_states.float() + action_ff_output.float() * action_c_gate_msa).type_as(action_hidden_states)
+        video_norm_hidden_states = (self.norm3(video_hidden_states.float()) * (1 + video_c_scale_msa) + video_c_shift_msa).type_as(video_hidden_states)
+        video_ff_output = self.ffn(video_norm_hidden_states)
+        video_hidden_states = (video_hidden_states.float() + video_ff_output.float() * video_c_gate_msa).type_as(video_hidden_states)
         # fmt: on
 
-        return video_hidden_states, action_hidden_states
+        return video_hidden_states
 
 
 class WanTransformer3DModel(ModelMixin, ConfigMixin):
@@ -336,7 +286,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
 
         # 2. Condition embeddings
-        self.condition_embedder = TimeVideoActionEmbedding(
+        self.condition_embedder = TimeVideoEmbedding(
             dim=inner_dim,
             time_freq_dim=freq_dim,
             time_proj_dim=inner_dim * 6,
@@ -357,7 +307,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
-        self.action_scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
     def init_weights(self) -> None:
         for name, module in self.named_modules():
@@ -381,8 +330,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         video_timestep: torch.Tensor,
         video_hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        action_timestep: Optional[torch.Tensor] = None,
-        action_hidden_states: Optional[torch.Tensor] = None,
     ):
         B, C, T, H, W = video_hidden_states.shape
 
@@ -396,37 +343,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         video_hidden_states = self.patch_embedding(video_hidden_states)
         video_hidden_states = video_hidden_states.flatten(2).transpose(1, 2)
 
-        if action_hidden_states is not None:
-            B, action_tokens, _ = action_hidden_states.shape
-
-            video_cos, video_sin = rotary_emb
-
-            device = video_cos.device
-            dtype = video_cos.dtype
-
-            action_cos = torch.ones(
-                1,
-                action_tokens,
-                1,
-                video_cos.shape[-1],
-                device=device,
-                dtype=dtype,
-            )
-
-            action_sin = torch.zeros(
-                1,
-                action_tokens,
-                1,
-                video_sin.shape[-1],
-                device=device,
-                dtype=dtype,
-            )
-
-            rotary_emb = (
-                torch.cat([video_cos, action_cos], dim=1),
-                torch.cat([video_sin, action_sin], dim=1),
-            )
-
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if video_timestep.ndim == 2:
             ts_seq_len = video_timestep.shape[1]
@@ -434,10 +350,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             ts_seq_len = None
 
-        video_temb, video_timestep_proj, action_temb, action_timestep_proj, encoder_hidden_states = (
+        video_temb, video_timestep_proj, encoder_hidden_states = (
             self.condition_embedder(
                 video_timestep=video_timestep,
-                action_timestep=action_timestep,
                 encoder_hidden_states=encoder_hidden_states,
             )
         )
@@ -449,17 +364,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             # batch_size, 6, inner_dim
             video_timestep_proj = video_timestep_proj.unflatten(1, (6, -1))
 
-        if action_timestep_proj is not None:
-            action_timestep_proj = action_timestep_proj.unflatten(1, (6, -1))
-
         for block in self.blocks:
-            video_hidden_states, action_hidden_states = block(
+            video_hidden_states = block(
                 video_hidden_states=video_hidden_states,
-                action_hidden_states=action_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 rotary_emb=rotary_emb,
                 video_temb=video_timestep_proj,
-                action_temb=action_timestep_proj,
             )
 
         # fmt: off
@@ -471,21 +381,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             # batch_size, inner_dim
             video_shift, video_scale = (self.scale_shift_table.to(video_temb.device) + video_temb.unsqueeze(1)).chunk(2, dim=1)
-        if action_temb is not None:
-            action_shift, action_scale = (self.action_scale_shift_table.to(action_temb.device) + action_temb.unsqueeze(1)).chunk(2, dim=1)
 
         video_shift = video_shift.to(video_hidden_states.device)
         video_scale = video_scale.to(video_hidden_states.device)
 
-        if action_hidden_states is not None:
-            action_shift = action_shift.to(action_hidden_states.device)
-            action_scale = action_scale.to(action_hidden_states.device)
-
-        if action_hidden_states is None:
-            video_hidden_states = (self.norm_out(video_hidden_states.float()) * (1.0 + video_scale) + video_shift).type_as(video_hidden_states)
-        else:
-            video_hidden_states = (self.norm_out(video_hidden_states.float()) * (1.0 + video_scale) + video_shift).type_as(video_hidden_states)
-            action_hidden_states = (self.norm_out(action_hidden_states.float()) * (1.0 + action_scale) + action_shift).type_as(action_hidden_states)
+        video_hidden_states = (self.norm_out(video_hidden_states.float()) * (1.0 + video_scale) + video_shift).type_as(video_hidden_states)
         # fmt: on
 
         video_hidden_states = self.proj_out(video_hidden_states)
@@ -500,7 +400,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             p3=p_w,
         )
 
-        return video_hidden_states, action_hidden_states
+        return video_hidden_states
 
 
 def test_wanvae(args, videos, device, dtype):
@@ -518,7 +418,7 @@ def test_wanvae(args, videos, device, dtype):
     return video_latents
 
 
-def test_transformer3d(args, video_latents, device, dtype, action_latents=None):
+def test_transformer3d(args, video_latents, device, dtype):
     batch_size = video_latents.shape[0]
 
     transformer3d, info = WanTransformer3DModel.from_pretrained(
@@ -535,25 +435,18 @@ def test_transformer3d(args, video_latents, device, dtype, action_latents=None):
     transformer3d = transformer3d.to(device=device, dtype=dtype)
 
     timestep = torch.zeros((batch_size), dtype=torch.float32, device=device)
-    if action_latents is not None:
-        action_timestep = torch.ones((batch_size), dtype=torch.float32, device=device)
 
     encoder_hidden_states = torch.randn(
         (batch_size, args.projector.num_token, args.projector.output_align_dim), device=device, dtype=dtype
     )
 
-    video_hidden_states, action_hidden_states = transformer3d(
+    video_hidden_states = transformer3d(
         video_timestep=timestep,
-        action_timestep=action_timestep,
         video_hidden_states=video_latents,
-        action_hidden_states=action_latents,
         encoder_hidden_states=encoder_hidden_states,
     )
 
     print(f"video_hidden_states.shape: {video_hidden_states.shape}")
-
-    if action_hidden_states is not None:
-        print(f"action_hidden_states.shape: {action_hidden_states.shape}")
 
 
 if __name__ == "__main__":
@@ -583,7 +476,5 @@ if __name__ == "__main__":
     data = next(iter(eval_dataloader))
     videos = data["videos"]
 
-    action_latents = torch.randn((batch_size, 4, 3072))
-
     video_latents = test_wanvae(args, videos, device, dtype)
-    test_transformer3d(args, video_latents, device, dtype, action_latents=action_latents)
+    test_transformer3d(args, video_latents, device, dtype)

@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
-from univam.models.wanva import Wan22VisionActionModel
+from univam.models.wanva import Wan22VisionModel
 from univam.utils.data import check_tensor, complex_to_device, fp32_to_bf16, move_to_cuda
 from univam.utils.files import ensure_directory, ensure_dirname
 from univam.utils.metrics import Meter, Timer, calculate_psnr, calculate_ssim, get_parameters
@@ -22,8 +22,8 @@ overwatch = initialize_overwatch(__name__)
 
 
 class Trainer:
-    def __init__(self, args, model: Wan22VisionActionModel, optimizer=None, lr_scheduler=None) -> None:
-        self.model: Wan22VisionActionModel = model
+    def __init__(self, args, model: Wan22VisionModel, optimizer=None, lr_scheduler=None) -> None:
+        self.model: Wan22VisionModel = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
 
@@ -54,9 +54,6 @@ class Trainer:
         self.image_size = args.data.image_size
         self.log_dir = os.path.join(args.log_dir, args.task_name)
         self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name)
-
-        self.train_with_action = args.train.train_with_action
-        self.model.set_train_mode(self.train_with_action)
 
         if overwatch.is_rank_zero() and args.do_train:
             ensure_directory(self.log_dir)
@@ -154,10 +151,11 @@ class Trainer:
         overwatch.warning(f"Saving models to {save_path}")
 
         self.accelerator.wait_for_everyone()
+        # get_state_dict is a collective operation; all ranks must participate
+        model_dict = self.accelerator.get_state_dict(self.model)
+        projector_model_dict = self.accelerator.get_state_dict(self.model.projector)
         if overwatch.is_rank_zero():
             ensure_directory(save_path)
-            model_dict = self.accelerator.get_state_dict(self.model)
-            projector_model_dict = self.accelerator.get_state_dict(self.model.projector)
             self.model._save_ckpt(model_dict, projector_model_dict, save_path, self.global_step)
 
     def load_checkpoint(self, load_path) -> None:
@@ -175,7 +173,7 @@ class Trainer:
     def train_eval_by_iter(self, train_loader, eval_loader=None, use_tqdm=True) -> None:
         self.model, self.optimizer, train_loader = self.accelerator.prepare(self.model, self.optimizer, train_loader)
 
-        if self.num_iters:
+        if self.num_iters is not None:
             overwatch.warning("Start train & val phase...")
         else:
             overwatch.warning("Skip train & val phase...")
@@ -300,15 +298,20 @@ class Trainer:
         label_videos = []
         pred_videos = []
 
-        label_actions = []
-        pred_actions = []
+        # ensure all ranks iterate the same number of batches to prevent gather deadlock
+        # when dataset size is not divisible by world_size and drop_last=False
+        n_batches = len(eval_loader)
+        if DIST.is_initialized() and self.accelerator.num_processes > 1:
+            n_batches_tensor = torch.tensor([n_batches], device=self.accelerator.device)
+            DIST.all_reduce(n_batches_tensor, op=DIST.ReduceOp.MIN)
+            n_batches = int(n_batches_tensor.item())
 
         with torch.no_grad():
             if overwatch.is_rank_zero():
-                eval_loader = tqdm(eval_loader, total=len(eval_loader), ncols=150, dynamic_ncols=False)
-            else:
-                eval_loader = eval_loader
-            for inputs in eval_loader:
+                eval_loader = tqdm(eval_loader, total=n_batches, ncols=150, dynamic_ncols=False)
+            for batch_idx, inputs in enumerate(eval_loader):
+                if batch_idx >= n_batches:
+                    break
                 inputs = self.prepare_batch(inputs)
                 outputs = self.forward_step(inputs, use_tqdm=use_tqdm)
                 metric_and_loss = {k: v for k, v in outputs.items() if k.split("_")[0] in ["metric", "loss"]}
@@ -325,10 +328,6 @@ class Trainer:
 
                 label_videos.append(label_video)
                 pred_videos.append(pred_video)
-
-                if self.train_with_action:
-                    label_actions.append(outputs["input_actions"])
-                    pred_actions.append(outputs["actions"])
 
             label_videos = torch.cat(label_videos, dim=0)
             pred_videos = torch.cat(pred_videos, dim=0)
@@ -350,14 +349,6 @@ class Trainer:
             overwatch.info(f"SSIM: {eval_meter.avg['val/ssim']:.4f}")
             # overwatch.info(f"rFID: {calculate_rfid(pred_imgs, label_imgs):.4f}")
 
-            if self.train_with_action:
-                label_actions = torch.cat(label_actions, dim=0)
-                pred_actions = torch.cat(pred_actions, dim=0)
-                mse = torch.nn.functional.mse_loss(pred_actions, label_actions)
-                mse = self.reduce_mean(mse)
-                eval_meter.update({"val/mse": mse})
-                overwatch.info(f"MSE: {eval_meter.avg['val/mse']:.4f}")
-
             if overwatch.is_rank_zero():
                 self.accelerator.log(
                     {
@@ -366,9 +357,6 @@ class Trainer:
                     },
                     step=self.global_step,
                 )
-
-                if self.train_with_action:
-                    self.accelerator.log({"val/mse": eval_meter.avg["val/mse"]}, step=self.global_step)
 
                 video_path = os.path.join(self.log_dir, "videos", str(self.global_step))
                 gt_video_path = os.path.join(video_path, "gt")

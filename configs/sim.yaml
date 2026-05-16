@@ -39,8 +39,6 @@ data:
   eval_json_path: ./jsons/eval_sim.json
 
 train:
-  train_with_action: False
-  gamma: 10
   dist: True
   epochs: 200
   num_iters: null

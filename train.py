@@ -1,6 +1,6 @@
 import torch
 
-from univam.models.wanva import Wan22VisionActionModel
+from univam.models.wanva import Wan22VisionModel
 from univam.trainer import Trainer
 from univam.utils.args import load_args
 from univam.utils.data import get_loader_info, load_multi_datasets_form_json, set_seed
@@ -17,7 +17,7 @@ def main(args):
     # init models
     overwatch.info("Building models...")
     set_seed(args.seed)
-    model = Wan22VisionActionModel(args)
+    model = Wan22VisionModel(args)
     if args.do_train:
         overwatch.warning("Do training...")
 

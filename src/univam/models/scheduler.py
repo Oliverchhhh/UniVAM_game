@@ -122,8 +122,10 @@ class FlowMatchScheduler:
     def add_noise(self, original_samples, noise, timestep, timestep_id):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        sigma = self.sigmas[timestep_id].to(noise).view(noise.shape[0], *([1] * (noise.ndim - 1)))
-        sample = (1 - sigma) * original_samples + sigma * noise
+        # keep sigma in fp32 to avoid bf16 precision loss on small values
+        sigma = self.sigmas[timestep_id].to(device=noise.device, dtype=torch.float32)
+        sigma = sigma.view(noise.shape[0], *([1] * (noise.ndim - 1)))
+        sample = ((1 - sigma) * original_samples.float() + sigma * noise.float()).to(dtype=original_samples.dtype)
         return sample
 
     def training_target(self, sample, noise, timestep):
@@ -136,7 +138,8 @@ class FlowMatchScheduler:
 
     def calculate_loss(self, pred, target, timestep, timestep_id):
         weights = self.training_weight(timestep, timestep_id)
-        loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        # compute loss in fp32 to preserve precision under bf16 mixed precision
+        loss = torch.nn.functional.mse_loss(pred.float(), target.float(), reduction="none")
         loss = loss.reshape(loss.shape[0], -1).mean(dim=1)
         loss = loss * weights
         loss = loss.mean()

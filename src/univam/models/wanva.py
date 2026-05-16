@@ -1,12 +1,11 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
-from univam.models.action import ActionDecoder, ActionEncoder
 from univam.models.projector import MLPProjector, QformerProjector
 from univam.models.scheduler import FlowMatchScheduler
 from univam.models.wan import WanTransformer3DModel, WanVAE
@@ -30,7 +29,7 @@ def sample_timestep_id(
     return timestep_id
 
 
-class Wan22VisionActionModel(nn.Module):
+class Wan22VisionModel(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
 
@@ -92,11 +91,6 @@ class Wan22VisionActionModel(nn.Module):
         else:
             raise ValueError(f"Unknown projector type '{config.projector.type}'. ")
 
-        self.gamma = getattr(config.train, "gamma", 10)
-
-        self.action_encoder = ActionEncoder(config.action, self.transformer3d.inner_dim)
-        self.action_decoder = ActionDecoder(config.action, self.transformer3d.inner_dim)
-
         self.seed = getattr(config, "seed", 33)
         self.guidance_scale = getattr(config.wanva, "guidance_scale", 1.0)
         self.num_inference_steps = getattr(config.wanva, "num_inference_steps", 100)
@@ -109,14 +103,6 @@ class Wan22VisionActionModel(nn.Module):
         )
         self.video_scheduler.set_timesteps(num_inference_steps=1000, training=True)
 
-        self.action_scheduler = FlowMatchScheduler(
-            shift=5.0,
-            sigma_min=0.0,
-            extra_one_step=True,
-            num_train_timesteps=1000,
-        )
-        self.action_scheduler.set_timesteps(num_inference_steps=1000, training=True)
-
         self.eval_scheduler = FlowMatchScheduler(
             shift=5.0,
             sigma_min=0.0,
@@ -126,11 +112,6 @@ class Wan22VisionActionModel(nn.Module):
 
         self.token_dropout = getattr(config.wanva, "token_dropout", False)
         self.num_token = config.projector.num_token
-
-        self.train_with_action = False
-
-    def set_train_mode(self, use_action=False):
-        self.train_with_action = use_action
 
     def to(self, *args, **kwargs):
         model_converted = super().to(*args, **kwargs)
@@ -158,12 +139,23 @@ class Wan22VisionActionModel(nn.Module):
         for k, v in model_dict.items():
             if not any(k.startswith(prefix) for prefix in exclude_prefixes):
                 save_dict["model"][k] = v
-        torch.save(save_dict, os.path.join(save_path, "Wan22VAM.pth"))
+        torch.save(save_dict, os.path.join(save_path, "Wan22VM.pth"))
         torch.save(projector_model_dict, os.path.join(save_path, "Projector.pth"))
 
     def _load_ckpt(self, load_path: str) -> int:
         assert os.path.exists(os.path.join(load_path, "Projector.pth")), f"Projector.pth not found in {load_path}"
-        assert os.path.exists(os.path.join(load_path, "Wan22VAM.pth")), f"Wan22VAM.pth not found in {load_path}"
+
+        ckpt_name = "Wan22VM.pth"
+        ckpt_path = os.path.join(load_path, ckpt_name)
+        if not os.path.exists(ckpt_path):
+            old_ckpt_name = "Wan22VAM.pth"
+            old_ckpt_path = os.path.join(load_path, old_ckpt_name)
+            if os.path.exists(old_ckpt_path):
+                overwatch.warning(f"{ckpt_name} not found, falling back to legacy {old_ckpt_name}")
+                ckpt_path = old_ckpt_path
+            else:
+                raise FileNotFoundError(f"Neither {ckpt_name} nor {old_ckpt_name} found in {load_path}")
+
         overwatch.warning(f"loading checkpoints from {load_path}")
 
         def _log_missing_unexpected(title, missing_keys, unexpected_keys):
@@ -178,9 +170,9 @@ class Wan22VisionActionModel(nn.Module):
             overwatch.warning(f"{title} - Missing top-level keys: {top_missing}")
             overwatch.warning(f"{title} - Unexpected top-level keys: {top_unexpected}")
 
-        wanvam_ckpt = torch.load(os.path.join(load_path, "Wan22VAM.pth"), map_location="cpu")
+        wanvam_ckpt = torch.load(ckpt_path, map_location="cpu")
         missing, unexpected = self.load_state_dict(wanvam_ckpt["model"], strict=False)
-        _log_missing_unexpected("Wan22VAM", missing, unexpected)
+        _log_missing_unexpected("Wan22VM", missing, unexpected)
 
         projector_ckpt = torch.load(os.path.join(load_path, "Projector.pth"), map_location="cpu")
         missing, unexpected = self.projector.load_state_dict(projector_ckpt, strict=False)
@@ -238,18 +230,13 @@ class Wan22VisionActionModel(nn.Module):
 
     def train_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> Dict[str, Any]:
         videos: torch.Tensor = inputs["videos"]  # [B, T, C, H, W]
-        actions: Optional[torch.Tensor] = None
-        if self.train_with_action and inputs.get("actions", None) is not None:
-            actions = inputs["actions"]
-            actions = actions.reshape(actions.shape[0], -1, actions.shape[-1])
-            actions = actions[:, :-1, :]
 
         video_latents = self.wanvae.encode(videos)
         video_latents = video_latents.to(dtype=self.dtype)
 
         video_embeds = self.encode(video_latents)
 
-        # video part flow matching
+        # video flow matching
         video_noise = torch.randn_like(video_latents, dtype=self.dtype)
 
         video_timestep_id = sample_timestep_id(
@@ -264,33 +251,9 @@ class Wan22VisionActionModel(nn.Module):
 
         video_target = self.video_scheduler.training_target(video_latents, video_noise, video_timesteps)
 
-        # action part flow matching
-        action_timesteps = None
-        action_noisy_latents = None
-        if actions is not None:
-            action_noise = torch.randn_like(actions, dtype=self.dtype)
-
-            action_timestep_id = sample_timestep_id(
-                batch_size=actions.shape[0],
-                num_train_timesteps=self.action_scheduler.num_train_timesteps,
-            )
-            action_timesteps = self.action_scheduler.timesteps[action_timestep_id].to(
-                dtype=self.dtype, device=self.device
-            )
-
-            action_noisy_latents = self.action_scheduler.add_noise(
-                actions, action_noise, action_timesteps, action_timestep_id
-            )
-
-            action_target = self.action_scheduler.training_target(actions, action_noise, action_timesteps)
-
-            action_noisy_latents = self.action_encoder(action_noisy_latents)
-
-        video_pred_latents, action_pred_latents = self.transformer3d(
+        video_pred_latents = self.transformer3d(
             video_timestep=video_timesteps,
-            action_timestep=action_timesteps,
             video_hidden_states=video_noisy_latents,
-            action_hidden_states=action_noisy_latents,
             encoder_hidden_states=video_embeds,
         )
         check_tensor(video_pred_latents, "video_pred_latents", check_bound=100, check_std=10)
@@ -302,21 +265,6 @@ class Wan22VisionActionModel(nn.Module):
             timestep_id=video_timestep_id,
         )
 
-        if actions is not None:
-            check_tensor(action_pred_latents, "action_pred_latents", check_bound=100, check_std=10)
-            action_pred_latents = self.action_decoder(action_pred_latents)
-            action_loss = self.action_scheduler.calculate_loss(
-                action_pred_latents,
-                action_target,
-                timestep=action_timesteps,
-                timestep_id=action_timestep_id,
-            )
-            loss = video_loss + self.gamma * action_loss
-            outputs["loss_video"] = video_loss
-            outputs["loss_action"] = action_loss
-            outputs["loss"] = loss
-            return outputs
-
         outputs["loss"] = video_loss
         return outputs
 
@@ -324,11 +272,6 @@ class Wan22VisionActionModel(nn.Module):
     def eval_step(self, inputs: Dict[str, Any], outputs: Dict[str, Any], use_tqdm: bool = True) -> Dict[str, Any]:
         videos = inputs["videos"]
         generator = inputs["generator"]
-        actions: Optional[torch.Tensor] = None
-        if self.train_with_action and inputs.get("actions", None) is not None:
-            actions = inputs["actions"]
-            actions = actions.reshape(actions.shape[0], -1, actions.shape[-1])
-            actions = actions[:, :-1, :]
 
         video_latents = self.wanvae.encode(videos)
 
@@ -346,56 +289,28 @@ class Wan22VisionActionModel(nn.Module):
             device=self.device,
             generator=generator,
         )
-        action_latents = None
-        if actions is not None:
-            action_latents = self.prepare_latents(
-                shape=actions.shape,
-                dtype=self.dtype,
-                device=self.device,
-                generator=generator,
-            )
-            action_latents = self.action_encoder(action_latents)
 
         with self.progress_bar(total=self.num_inference_steps, use_tqdm=use_tqdm) as progress_bar:
             for t in timesteps:
                 video_latent_input = torch.cat([video_latents] * 2) if do_classifier_free_guidance else video_latents
-                action_latent_input = None
-                if actions is not None:
-                    action_latent_input = (
-                        torch.cat([action_latents] * 2) if do_classifier_free_guidance else action_latents
-                    )
 
                 timestep = t.expand(video_latent_input.shape[0])
-                video_noise_pred, action_noise_pred = self.transformer3d(
+                video_noise_pred = self.transformer3d(
                     video_timestep=timestep,
-                    action_timestep=timestep,
                     video_hidden_states=video_latent_input,
-                    action_hidden_states=action_latent_input,
                     encoder_hidden_states=video_embeds,
                 )
 
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = video_noise_pred.chunk(2)
                     video_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    if actions is not None:
-                        noise_pred_uncond, noise_pred_text = action_noise_pred.chunk(2)
-                        action_noise_pred = noise_pred_uncond + self.guidance_scale * (
-                            noise_pred_text - noise_pred_uncond
-                        )
 
                 video_latents = self.eval_scheduler.step(video_noise_pred, t, video_latents)
-                if action_latents is not None:
-                    action_latents = self.eval_scheduler.step(action_noise_pred, t, action_latents)
 
                 progress_bar.update()
 
         video_latents = video_latents.to(dtype=self.dtype)
         gen_videos = self.wanvae.decode(video_latents)
-        if actions is not None:
-            action_latents = action_latents.to(dtype=self.dtype)
-            pred_actions = self.action_decoder(action_latents)
-            outputs["actions"] = pred_actions
-            outputs["input_actions"] = actions
 
         outputs["videos"] = gen_videos
         return outputs
@@ -421,8 +336,8 @@ class FlopsWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, videos, actions=None, **kwargs):
-        inputs = {"videos": videos, "actions": actions}
+    def forward(self, videos, **kwargs):
+        inputs = {"videos": videos}
         return self.model(inputs, **kwargs)
 
 
@@ -455,24 +370,22 @@ if __name__ == "__main__":
     data = next(iter(eval_dataloader))
 
     videos = data["videos"]
-    actions = data["actions"]
 
-    # >>> start main test for Wan22VisionActionModel <<<
-    model = Wan22VisionActionModel(args).to(device=device, dtype=dtype)
-    model.set_train_mode(use_action=True)
+    # >>> start main test for Wan22VisionModel <<<
+    model = Wan22VisionModel(args).to(device=device, dtype=dtype)
     model = FlopsWrapper(model)
 
     total_params = sum(p.numel() for p in model.parameters())
 
     # train part
     model.train()
-    train_outputs = model(videos, actions)
-    train_flops = FlopCountAnalysis(model, (videos, actions)).total()
+    train_outputs = model(videos)
+    train_flops = FlopCountAnalysis(model, (videos,)).total()
 
     # eval part
     model.eval()
-    eval_outputs = model(videos, actions)
-    eval_flops = FlopCountAnalysis(model, (videos, actions)).total()
+    eval_outputs = model(videos)
+    eval_flops = FlopCountAnalysis(model, (videos,)).total()
 
     print(">>>>> general part <<<<<")
     print(f"Total params: {total_params / 1e6:.2f} M")
@@ -485,4 +398,4 @@ if __name__ == "__main__":
     print(">>>>> eval part <<<<<")
     # print(f"FLOPs: {eval_flops / 1e9:.2f} GFLOPs")
     print(f"Output shape: {eval_outputs['videos'].shape}")
-    # >>> end main test for Wan22VisionActionModel <<<
+    # >>> end main test for Wan22VisionModel <<<

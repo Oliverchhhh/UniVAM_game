@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from univam.models.wanva import Wan22VisionActionModel
+from univam.models.wanva import Wan22VisionModel
 from univam.trainer import Trainer
 from univam.utils.args import load_args
 from univam.utils.data import load_multi_datasets_form_json, set_seed
@@ -37,7 +37,7 @@ def main(args, vis_diff=False, scale=1):
     )
 
     overwatch.info("Building model...")
-    model = Wan22VisionActionModel(args).to(device=device, dtype=dtype)
+    model = Wan22VisionModel(args).to(device=device, dtype=dtype)
     model.eval()
 
     trainer = Trainer(args=args, model=model)
