@@ -49,7 +49,7 @@ class Wan22VisionModel(nn.Module):
         vae_width = width // vae_hw
 
         self.patch_size = config.wanva.patch_size
-        self.projector_patch_size = config.projector.patch_size
+        self.proj_patch_size = config.projector.patch_size
 
         self.transformer3d = WanTransformer3DModel.from_pretrained(
             config.wanva.model_path,
@@ -61,16 +61,44 @@ class Wan22VisionModel(nn.Module):
             ignore_mismatched_sizes=True,
         )
         self.transformer3d.init_weights()  # also materializes meta params from custom modules
-        # self.transformer3d.enable_gradient_checkpointing() # 没什么大用
 
-        self.patch_embedding = nn.Conv3d(
+        self._use_lora = getattr(config, "lora", None) is not None and config.lora.enable
+        if self._use_lora:
+            from peft import LoraConfig, get_peft_model
+
+            lora_config = LoraConfig(
+                r=config.lora.r,
+                lora_alpha=config.lora.lora_alpha,
+                target_modules=[
+                    "attn1.to_q",
+                    "attn1.to_k",
+                    "attn1.to_v",
+                    "attn1.to_out.0",
+                    "attn2.to_q",
+                    "attn2.to_k",
+                    "attn2.to_v",
+                    "attn2.to_out.0",
+                ],
+                modules_to_save=[
+                    "condition_embedder",
+                    "patch_embedding",
+                    "proj_out",
+                ],
+            )
+            self.transformer3d = get_peft_model(self.transformer3d, lora_config)
+            overwatch.warning(
+                f"LoRA enabled: r={config.lora.r}, alpha={config.lora.lora_alpha}, "
+                f"trainable params={sum(p.numel() for p in self.transformer3d.parameters() if p.requires_grad):,}"
+            )
+
+        self.vae_proj = nn.Conv3d(
             self.wanvae.vae.config.z_dim,
             config.projector.output_align_dim,
-            kernel_size=self.projector_patch_size,
-            stride=self.projector_patch_size,
+            kernel_size=self.proj_patch_size,
+            stride=self.proj_patch_size,
         )
 
-        pt, ph, pw = self.projector_patch_size
+        pt, ph, pw = self.proj_patch_size
         wt, wh, ww = self.patch_size = config.wanva.patch_size
         assert latent_t_num % (pt * wt) == 0, f"{latent_t_num=} must be divisible by {pt*wt=}"
 
@@ -130,7 +158,11 @@ class Wan22VisionModel(nn.Module):
 
     def set_trainable_params(self):
         self.transformer3d.train()
-        self.transformer3d.requires_grad_(True)
+        if not self._use_lora:
+            self.transformer3d.requires_grad_(True)
+
+        self.vae_proj.train()
+        self.vae_proj.requires_grad_(True)
 
         self.projector.train()
         self.projector.requires_grad_(True)
@@ -138,14 +170,38 @@ class Wan22VisionModel(nn.Module):
         self.wanvae.eval()
         self.wanvae.requires_grad_(False)
 
-    def _save_ckpt(self, model_dict: Dict, projector_model_dict: Dict, save_path: str, global_step: int) -> None:
-        exclude_prefixes = ["wanvae", "projector"]
-        save_dict = {"model": {}, "global_step": global_step}
-        for k, v in model_dict.items():
-            if not any(k.startswith(prefix) for prefix in exclude_prefixes):
-                save_dict["model"][k] = v
-        torch.save(save_dict, os.path.join(save_path, "Wan22VM.pth"))
-        torch.save(projector_model_dict, os.path.join(save_path, "Projector.pth"))
+    def _save_ckpt(self, model_dict: Dict, projector_dict: Dict, save_path: str, global_step: int) -> None:
+        if self._use_lora:
+            # Wan22VM.pth: only Wan22VisionModel-level trainable params (vae_proj).
+            # Frozen transformer base weights are reloaded from from_pretrained.
+            _outer_exclude = ("wanvae", "projector", "transformer3d")
+            base_dict = {}
+            for k, v in model_dict.items():
+                if not any(k.startswith(p) for p in _outer_exclude):
+                    base_dict[k] = v
+            torch.save({"model": base_dict, "global_step": global_step},
+                       os.path.join(save_path, "Wan22VM.pth"))
+
+            # LoraAdapter.pth: LoRA low-rank + modules_to_save.
+            # Use model_dict keys (have full .default suffix), strip transformer3d.
+            # prefix so they match PeftModel internal keys on load.
+            lora_state = {}
+            for k, v in model_dict.items():
+                if any(p in k for p in ("lora_", "original_module", "modules_to_save")):
+                    lora_state[k[len("transformer3d."):]] = v.cpu()
+            torch.save(lora_state, os.path.join(save_path, "LoraAdapter.pth"))
+        else:
+            # Full training: filter out wanvae/projector, save rest
+            exclude_prefixes = ["wanvae", "projector"]
+            base_dict = {}
+            for k, v in model_dict.items():
+                if any(k.startswith(prefix) for prefix in exclude_prefixes):
+                    continue
+                base_dict[k] = v
+            torch.save({"model": base_dict, "global_step": global_step},
+                       os.path.join(save_path, "Wan22VM.pth"))
+
+        torch.save(projector_dict, os.path.join(save_path, "Projector.pth"))
 
     def _load_ckpt(self, load_path: str) -> int:
         assert os.path.exists(os.path.join(load_path, "Projector.pth")), f"Projector.pth not found in {load_path}"
@@ -153,13 +209,7 @@ class Wan22VisionModel(nn.Module):
         ckpt_name = "Wan22VM.pth"
         ckpt_path = os.path.join(load_path, ckpt_name)
         if not os.path.exists(ckpt_path):
-            old_ckpt_name = "Wan22VAM.pth"
-            old_ckpt_path = os.path.join(load_path, old_ckpt_name)
-            if os.path.exists(old_ckpt_path):
-                overwatch.warning(f"{ckpt_name} not found, falling back to legacy {old_ckpt_name}")
-                ckpt_path = old_ckpt_path
-            else:
-                raise FileNotFoundError(f"Neither {ckpt_name} nor {old_ckpt_name} found in {load_path}")
+            raise FileNotFoundError(f"{ckpt_name} not found in {load_path}")
 
         overwatch.warning(f"loading checkpoints from {load_path}")
 
@@ -182,6 +232,19 @@ class Wan22VisionModel(nn.Module):
         projector_ckpt = torch.load(os.path.join(load_path, "Projector.pth"), map_location="cpu")
         missing, unexpected = self.projector.load_state_dict(projector_ckpt, strict=False)
         _log_missing_unexpected("Projector", missing, unexpected)
+
+        if self._use_lora:
+            lora_path = os.path.join(load_path, "LoraAdapter.pth")
+            if os.path.exists(lora_path):
+                lora_state = torch.load(lora_path, map_location="cpu")
+                # LoraAdapter.pth only contains LoRA + modules_to_save (subset).
+                self.transformer3d.load_state_dict(lora_state, strict=False)
+                overwatch.warning(f"Loaded LoRA adapter from {lora_path}")
+            else:
+                overwatch.warning(
+                    f"LoRA enabled but no LoraAdapter.pth found in {load_path}; "
+                    "LoRA weights will be randomly initialized"
+                )
 
         return wanvam_ckpt["global_step"]
 
@@ -216,7 +279,7 @@ class Wan22VisionModel(nn.Module):
     def encode(self, video_latents: torch.Tensor, do_classifier_free_guidance: bool = False):
         dtype = next(self.projector.parameters()).dtype
         video_latents = video_latents.to(device=self.device, dtype=dtype)
-        video_latents = self.patch_embedding(video_latents)
+        video_latents = self.vae_proj(video_latents)
         video_latents = video_latents.flatten(2).transpose(1, 2)
 
         video_embeds = self.projector(video_latents)

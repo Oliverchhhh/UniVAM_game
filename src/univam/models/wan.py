@@ -236,9 +236,7 @@ class WanTransformer3DModel(
     def init_weights(self) -> None:
         # 1. Materialize and initialize meta params from custom modules not in checkpoint
         for name, module in self.named_modules():
-            has_meta = any(
-                p.device.type == "meta" for p in module.parameters(recurse=False)
-            )
+            has_meta = any(p.device.type == "meta" for p in module.parameters(recurse=False))
             if not has_meta:
                 continue
 

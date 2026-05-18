@@ -55,27 +55,9 @@ def main(args):
         )
         _, images_per_batch, args.train.iter_per_ep, args.train.num_iters = train_info
 
-        optimizer_grouped_parameters = [
-            {
-                "params": model.projector.parameters(),
-                "lr": args.train.learning_rate * 1,
-            },
-            {
-                "params": model.transformer3d.condition_embedder.parameters(),
-                "lr": args.train.learning_rate * 1,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.transformer3d.named_parameters()
-                    if "condition_embedder" not in n and p.requires_grad
-                ],
-                "lr": args.train.learning_rate,
-            },
-        ]
-
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = get_optimizer(
-            optimizer_grouped_parameters,
+            trainable_params,
             opt_type="AdamW",
             lr=args.train.learning_rate,
             betas=(0.9, 0.999),

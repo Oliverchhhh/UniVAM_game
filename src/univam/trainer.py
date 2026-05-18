@@ -34,7 +34,7 @@ class Trainer:
         self.epoch = -1
         self.global_step = -1
 
-        self.eval_before_train = False
+        self.eval_before_train = True
 
         self.resume = args.resume
         self.resume_path = args.resume_path
@@ -148,7 +148,7 @@ class Trainer:
 
     def save_checkpoint(self) -> None:
         save_path = os.path.join(self.ckpt_save_dir, str(self.global_step))
-        overwatch.warning(f"Saving models to {save_path}")
+        overwatch.warning(f"Saving checkpoint to {save_path}")
 
         self.accelerator.wait_for_everyone()
         # get_state_dict is a collective operation; all ranks must participate.
@@ -159,7 +159,7 @@ class Trainer:
         if full_state_dict is not None:
             for k, v in full_state_dict.items():
                 if k.startswith("projector."):
-                    projector_dict[k[len("projector."):]] = v
+                    projector_dict[k[len("projector.") :]] = v
                 else:
                     model_dict[k] = v
 
@@ -167,9 +167,26 @@ class Trainer:
             ensure_directory(save_path)
             self.model._save_ckpt(model_dict, projector_dict, save_path, self.global_step)
 
+        # Save optimizer / scheduler / RNG state for full training resume.
+        # accelerate handles both normal and DeepSpeed ZeRO formats internally.
+        # train_state_dir = os.path.join(save_path, "train_state")
+        # self.accelerator.save_state(train_state_dir, safe_serialization=False)
+
     def load_checkpoint(self, load_path) -> None:
         global_step = self.model._load_ckpt(load_path)
         self.global_step = global_step
+
+    def _resume_training_state(self) -> None:
+        """Load optimizer, scheduler and RNG state. Must be called after ``prepare()``."""
+        train_state_dir = os.path.join(self.resume_path, "train_state")
+        if os.path.isdir(train_state_dir):
+            self.accelerator.load_state(train_state_dir)
+            overwatch.warning(f"Resumed training state from {train_state_dir}")
+        else:
+            overwatch.warning(
+                f"No training state found at {train_state_dir}. "
+                "Optimizer and scheduler will be initialized from scratch (model weights loaded, this is fine)."
+            )
 
     def setup_model_for_training(self) -> None:
         if overwatch.is_rank_zero():
@@ -181,6 +198,9 @@ class Trainer:
 
     def train_eval_by_iter(self, train_loader, eval_loader=None, use_tqdm=True) -> None:
         self.model, self.optimizer, train_loader = self.accelerator.prepare(self.model, self.optimizer, train_loader)
+
+        if self.resume:
+            self._resume_training_state()
 
         if self.num_iters is not None:
             overwatch.warning("Start train & val phase...")
@@ -204,7 +224,7 @@ class Trainer:
         else:
             self.global_step = 0
 
-        if self.eval_before_train and self.global_step == 0:
+        if self.eval_before_train:
             if eval_loader:
                 eval_meter, eval_time = self.eval_fn(eval_loader, use_tqdm=use_tqdm)
                 overwatch.info(f"[Rank {self.rank}] Valid before train. Time: {eval_time}\n{eval_meter.avg}")
@@ -277,7 +297,7 @@ class Trainer:
                             overwatch.info(
                                 f"[Rank {self.rank}] Valid Step: {self.global_step}, Time: {eval_time}\n{eval_meter.avg}"
                             )
-                        torch.cuda.empty_cache()
+                        # torch.cuda.empty_cache()
 
                         # Update metric with eval metrics
                         train_meter = Meter()

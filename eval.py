@@ -37,6 +37,9 @@ def main(args, vis_diff=False, scale=1):
     )
 
     overwatch.info("Building model...")
+    # Keep lora.enable as-is: PeftModel uses dynamic forward W*x + B@(A*x),
+    # which matches training eval exactly. Wan22VM.pth provides frozen
+    # base weights, LoraAdapter.pth provides adapter + modules_to_save.
     model = Wan22VisionModel(args).to(device=device, dtype=dtype)
     model.eval()
 
@@ -151,8 +154,8 @@ def main(args, vis_diff=False, scale=1):
 if __name__ == "__main__":
     args = load_args()
     args.train.local_batch_size = 16
-    args.train.eval_sample_num = 32
-    args.data.image_size = [512, 512]
+    args.train.eval_sample_num = 2
+    args.data.image_size = [256, 256]
     args.data.eval_json_path = os.environ.get("EVAL_JSON_PATH", args.data.eval_json_path)
     args.resume_path = os.environ.get("RESUME_PATH", args.resume_path)
     main(args, vis_diff=True, scale=1)

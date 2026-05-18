@@ -4,36 +4,86 @@
 
 ## 技术架构
 
-整个模型基于 **Wan2.2-TI2V-5B**（5B 参数文本-图像-视频扩散模型）构建，采用 **Flow Matching** 方法进行训练和推理。
+整个模型基于 **Wan2.2-TI2V-5B**（5B 参数文本-图像-视频扩散模型）的 Transformer 和 VAE 构建，采用 **Flow Matching** 方法进行训练和推理。
 
 核心流程分为 4 步：
 
-1. **WanVAE（视频压缩）**：用冻结的 VAE 编码器将原始视频帧 `[B, T, 3, H, W]` 压缩到潜在空间 `[B, 16, T', H/8, W/8]`，空间压缩 8 倍，时间压缩约 4 倍
-2. **Patch Embedding**：用 3D 卷积将 VAE 潜变量进一步切分为视觉 token 序列
-3. **Projector（投影器）**：通过 Q-Former 或 MLP 将大量视觉 token 压缩为极少量的条件 token（默认仅 2-8 个），作为扩散去噪的条件信号
-4. **WanTransformer3D（去噪主干）**：30 层的 3D 扩散 Transformer，以条件 token 为引导，通过 Flow Matching 迭代去噪生成未来帧的潜变量，再由 VAE 解码回像素空间
+1. **WanVAE（视频压缩）**：用冻结的 VAE 编码器将原始视频帧 `[B, T, 3, H, W]` 压缩到潜在空间 `[B, 48, T', H/16, W/16]`，空间压缩 16 倍，时间压缩约 4 倍（4k+1 帧 → k+1 个潜在帧）
+2. **vae_proj（通道投影+Patch切分）**：用 3D 卷积将 VAE 潜变量（48 通道）投影到投影器的隐藏维度（4096），同时做空间 patch 切分（4×4）
+3. **Projector（投影器）**：通过 Q-Former 或 MLP 将大量视觉 token（如 128 个）压缩为极少量的条件 token（默认 2 个），作为扩散去噪的条件信号
+4. **WanTransformer3D（去噪主干）**：将原始的文字条件模块替换为 **TimeVideoEmbedding**（视频条件嵌入），以视觉条件 token 为引导，通过 Flow Matching 迭代去噪生成未来帧的潜变量，再由 VAE 解码回像素空间
 
 ```
-输入视频 → [冻结VAE] → 潜变量 → [Patch+投影] → 条件token(2-8个)
-                                                      ↓
-随机噪声 → [WanTransformer3D 去噪] ← 条件token 引导
+输入视频 → [冻结VAE] → 潜变量 [B,48,T',H/16,W/16]
+                            ↓
+                    [vae_proj Conv3d] → 视觉 token
+                            ↓
+                      [Projector] → 条件 token (2个)
+                            ↓
+                      TimeVideoEmbedding
+                            ↓
+随机噪声 → [WanTransformer3D 去噪] ← 条件信号
                  ↓
             预测潜变量 → [冻结VAE解码] → 预测视频帧
 ```
 
-### 可选投影器结构
+### 模块说明
 
-- **QformerProjector**：使用可学习的 query token 与视觉 token 做交叉注意力
-- **MLPProjector**：通过多层自注意力 + 卷积逐步压缩
+- **TimeVideoEmbedding**：自定义模块，替换了原始 Wan2.2 的 `WanTimeTextImageEmbedding`（文本+图像条件），改为纯视觉条件嵌入，使模型以视觉特征而非文字作为去噪引导
+- **vae_proj**：Wan22VisionModel 顶层的 3D 卷积（Conv3d），将 VAE 输出投影到投影器维度，不同于 Transformer 内部的 `patch_embedding`（DiT 的 patch 输入嵌入）
+- **Projector**：可选 Q-Former 或 MLP 结构，将大量视觉 token 压缩为极少量条件 token
 
 ### 可选动作条件
 
-支持 `train_with_action=True` 时，模型额外接收机器人动作序列作为条件，使用 `ActionEncoder` 将动作编码后融合到去噪过程中，实现动作条件下的视频预测。
+支持额外接收机器人动作序列作为条件，使用 `ActionEncoder` 将动作编码后融合到去噪过程。
 
 ## 训练与评估
 
 - **训练**：输入完整视频片段，VAE 编码后添加噪声，模型预测 Flow Matching 的 velocity field，损失函数为带时间步权重的 MSE
 - **评估**：输入视频前几帧，VAE 编码生成条件 token，Transformer 从纯噪声开始迭代去噪（默认 20 步），VAE 解码得到预测视频，计算 PSNR/SSIM 与真实视频对比
+
+## 训练模式
+
+### LoRA 微调（推荐）
+
+在预训练的 Wan2.2 Transformer 上使用 LoRA 低秩适配，大幅降低显存：
+
+```yaml
+lora:
+  enable: True      # 开关，false 时全量训练
+  r: 16             # 低秩维度
+  lora_alpha: 32    # 缩放系数（实际 scale = alpha/r）
+```
+
+- **LoRA 层**：所有 attention 的 Q/K/V/Out 投影（8 个 Linear × N 层，~32M 参数）
+- **全量训练层**（`modules_to_save`）：`condition_embedder`（自定义视频条件嵌入）、`patch_embedding`（Transformer 的 Conv3d 输入）、`proj_out`（输出投影）
+- **冻结层**：FFN、LayerNorm、scale_shift 等
+
+| 场景 | 全量训练 | LoRA (r=16) |
+|------|----------|-------------|
+| 可训练参数 | ~5B | ~48M |
+| 单卡 bf16 | 装不下 (~70 GB) | ~12 GB（24 GB 卡可跑） |
+| 8 卡 ZeRO-3 | ~12 GB/卡 | ~3 GB/卡 |
+
+### 分布式策略
+
+| 策略 | 配置文件 | 说明 |
+|------|----------|------|
+| ZeRO-2 | `configs/accelerate/zero2.yaml` | 优化器+梯度分片，参数不分片，推荐 8 卡全量训练 |
+| ZeRO-3 | `configs/accelerate/zero3.yaml` + `ds_zero3.json` | 参数+优化器+梯度全部分片，支持单卡 CPU offload |
+
+单卡 CPU offload 时，修改 `ds_zero3.json` 中 `offload_*_device` 从 `"none"` 改为 `"cpu"`。
+
+### 检查点格式
+
+| 文件 | 内容 | 说明 |
+|------|------|------|
+| `Wan22VM.pth` | Transformer 完整权重（LoRA 模式下为合并后的） | 可独立用于推理 |
+| `LoraAdapter.pth` | LoRA 低秩矩阵 + modules_to_save 权重 | 仅 LoRA 模式，用于精确恢复 |
+| `Projector.pth` | Projector 权重 | |
+| `train_state/` | 优化器 + 调度器 + RNG 状态 | 用于完整恢复训练 |
+
+跨模式 resume 支持：全量训练的 Wan22VM.pth 可直接加载为 LoRA 训练的基础权重（LoRA 部分随机初始化），LoRA 训练的 Wan22VM.pth（合并后）也可加载为全量训练的起点。
 
 ## 数据集支持
 
@@ -49,9 +99,9 @@
 
 ## 训练基础设施
 
-- **分布式训练**：HuggingFace Accelerate + DeepSpeed ZeRO-2，支持 8 GPU
+- **分布式训练**：HuggingFace Accelerate + DeepSpeed ZeRO-2/ZeRO-3，支持单卡至 8 GPU
 - **混合精度**：bf16
-- **优化器**：AdamW，三组不同学习率（projector 和 condition_embedder 用完整 lr，transformer 其余部分用基础 lr）
+- **优化器**：AdamW
 - **学习率调度**：线性预热后恒定（WarmupLinearConstantLR）
 - **采样策略**：支持多数据集混合训练，通过 credit-based 按比例分配每个 batch 中各数据集的样本
 
@@ -65,25 +115,28 @@ UniVAM/
 ├── download_models.py                # 下载预训练模型
 ├── configs/
 │   ├── debug.yaml                    # 调试配置
+│   ├── libero.yaml                   # LIBERO LoRA 训练配置
 │   ├── sim.yaml                      # 仿真配置
 │   ├── XVLA.yaml                     # XVLA 实验配置
-│   ├── XVLA_with_action.yaml         # XVLA + 动作条件配置
 │   ├── mix.yaml                      # 混合数据集配置
-│   └── accelerate/zero2.yaml         # DeepSpeed ZeRO-2 配置
+│   └── accelerate/
+│       ├── zero2.yaml                # DeepSpeed ZeRO-2 配置
+│       ├── zero3.yaml                # DeepSpeed ZeRO-3 accelerate 配置
+│       └── ds_zero3.json             # DeepSpeed ZeRO-3 原生 JSON 配置
 ├── jsons/                            # 数据集元数据 JSON 文件
 └── src/univam/
     ├── trainer.py                    # 训练循环、检查点保存、评估逻辑
     ├── models/
-    │   ├── wanva.py                  # 主模型 Wan22VisionModel + VAE 封装
-    │   ├── wan.py                    # WanTransformer3D（30 层 3D 扩散 Transformer）
+    │   ├── wanva.py                  # 主模型 Wan22VisionModel + LoRA + VAE 封装
+    │   ├── wan.py                    # WanTransformer3D + TimeVideoEmbedding + WanVAE
     │   ├── projector.py              # Qformer / MLP 投影器
     │   ├── scheduler.py              # Flow Matching 调度器
     │   ├── action.py                 # 动作编解码器
-    │   └── backbone.py               # 视觉 backbone / DiT backbone（独立模块）
+    │   └── backbone.py               # 视觉 backbone（独立模块）
     └── utils/
         ├── args.py                   # 配置加载（OmegaConf）
         ├── data.py                   # 数据集加载、采样器、张量工具
-        ├── metrics.py                # PSNR、SSIM、FID、Meter、Timer
+        ├── metrics.py                # PSNR、SSIM、Meter、Timer
         ├── optim.py                  # 优化器工厂 + WarmupLinearConstantLR
         ├── files.py                  # 目录工具
         ├── overwatch.py              # 分布式日志
@@ -97,20 +150,24 @@ UniVAM/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `lora.enable` | `True` | 是否启用 LoRA 微调 |
+| `lora.r` | 16 | LoRA 低秩维度 |
+| `lora.lora_alpha` | 32 | LoRA 缩放系数 |
 | `projector.type` | `qformer` | 投影器类型（`mlp` 或 `qformer`） |
 | `projector.num_token` | 2 | 压缩后的条件 token 数量 |
 | `projector.hidden_dim` | 4096 | 投影器隐藏层维度 |
-| `projector.output_align_dim` | 4096 | 输出维度（与 Transformer video_dim 对齐） |
-| `projector.patch_size` | [1, 4, 4] | VAE 潜变量的 3D patch 尺寸 |
-| `wanva.patch_size` | [1, 2, 2] | Transformer 的 3D patch 尺寸 |
+| `projector.output_align_dim` | 4096 | 输出维度（与 Transformer 对齐） |
+| `projector.patch_size` | [1, 2, 2] | 经过 VAE encoder 要接入 projector 的 3D patch 尺寸 |
+| `wanva.patch_size` | [1, 2, 2] | Transformer 内部 3D patch 尺寸 |
 | `wanva.num_attention_heads` | 24 | Transformer 注意力头数 |
-| `data.frames` | 5 | 每个片段帧数 |
-| `data.fps` | 10 | 目标帧率 |
-| `data.image_size` | [512, 512] | 帧分辨率 |
-| `train.learning_rate` | 3e-5 | 基础学习率 |
+| `data.type` | `video` | 数据集格式（`video` / `hdf5` / `lerobot`） |
+| `data.frames` | 5 | 每个片段帧数（4k+1 格式） |
+| `data.fps` | 2 | 目标帧率（重采样） |
+| `data.image_size` | [256, 256] | 帧分辨率 |
+| `train.local_batch_size` | 1 | 每 GPU 的 batch size |
+| `train.learning_rate` | 3e-5 | 学习率 |
 | `train.warmup_ratio` | 0.01 | 预热比例 |
 | `train.decay` | 1e-3 | 权重衰减 |
-| `train.gradient_accumulate_steps` | 2 | 梯度累积步数 |
 
 ## 🚀 Quick Start
 

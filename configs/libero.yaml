@@ -1,8 +1,8 @@
 seed: 33
 do_train: True
 log_dir: logs
-resume: False
-resume_path: null
+resume: True
+resume_path: ckpts/libero/47000
 task_name: libero
 
 action:
@@ -38,15 +38,20 @@ data:
   train_json_path: ./jsons/train_libero.json
   eval_json_path: ./jsons/eval_libero.json
 
+lora:
+  enable: True
+  r: 16
+  lora_alpha: 32
+
 train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 20
-  save_step: 20
-  local_batch_size: 1
+  eval_step: 1000
+  save_step: 1000
+  local_batch_size: 32
   eval_sample_num: 4
-  learning_rate: 3e-5
+  learning_rate: 1e-4     # 3e-5 | 1e-4 for lora
   warmup_ratio: 0.01
   decay: 1e-3
   ckpt_save_dir: ckpts
