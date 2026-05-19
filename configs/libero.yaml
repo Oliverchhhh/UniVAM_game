@@ -2,7 +2,7 @@ seed: 33
 do_train: True
 log_dir: logs
 resume: True
-resume_path: ckpts/libero/47000
+resume_path: ckpts/libero/149400
 task_name: libero
 
 action:
@@ -56,3 +56,4 @@ train:
   decay: 1e-3
   ckpt_save_dir: ckpts
   gradient_accumulate_steps: 1
+  reset_global_step: True  # when resume=True, set True to ignore checkpoint global_step and start from 0

@@ -3,11 +3,11 @@ do_train: True
 log_dir: logs
 resume: False
 resume_path: null
-task_name: XVLA_2token
+task_name: fractal
 
 action:
   num_layers: 6
-  action_dim: 14
+  action_dim: 7
   chunk_size: 4
 
 projector:
@@ -19,7 +19,7 @@ projector:
   hidden_dim: 4096
   output_align_dim: 4096
   cross_attention_dim: 2048
-  patch_size: [1, 4, 4]
+  patch_size: [1, 2, 2]
 
 wanva:
   token_dropout: False
@@ -30,24 +30,30 @@ wanva:
   model_path: ${oc.env:PRETRAINED_MODEL_PATH}/Wan-AI/Wan2.2-TI2V-5B-Diffusers/
 
 data:
-  type: hdf5 # video | hdf5
-  fps: 24
+  type: video # video | hdf5 | lerobot
+  fps: 2
   frames: 5
   num_workers: 16
-  image_size: [512, 512]
-  train_json_path: ./jsons/train_XVLA.json
-  eval_json_path: ./jsons/eval_XVLA.json
+  image_size: [256, 256]
+  train_json_path: ./jsons/train_fractal.json
+  eval_json_path: ./jsons/eval_fractal.json
+
+lora:
+  enable: True
+  r: 16
+  lora_alpha: 32
 
 train:
   dist: True
   epochs: 200
   num_iters: null
-  eval_step: 2500
-  save_step: 2500
-  local_batch_size: 8
-  eval_sample_num: 8
-  learning_rate: 3e-5
-  warmup_ratio: 0.0001
+  eval_step: 1000
+  save_step: 1000
+  local_batch_size: 32
+  eval_sample_num: 4
+  learning_rate: 2e-4     # 3e-5 | 1e-4 for lora
+  warmup_ratio: 0.01
   decay: 1e-3
   ckpt_save_dir: ckpts
-  gradient_accumulate_steps: 2
+  gradient_accumulate_steps: 1
+  reset_global_step: True  # when resume=True, set True to ignore checkpoint global_step and start from 0

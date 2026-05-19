@@ -11,6 +11,8 @@ local_dir = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
 repo_ids = [
     "physical-intelligence/libero",
+    "ericonaldo/Bridge-V2",
+    "ucasmichael/fractal20220817_data"
 ]
 
 for repo_id in repo_ids:

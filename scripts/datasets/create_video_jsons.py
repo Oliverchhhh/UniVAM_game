@@ -112,10 +112,14 @@ if __name__ == "__main__":
 
     train_video_dirs = [
         dataset_path / "physical-intelligence/libero_videos/train",
+        # dataset_path / "ericonaldo/bridge_v2_videos/train",
+        # dataset_path / "physical-intelligence/libero_videos/train",
     ]
 
     eval_video_dirs = [
         dataset_path / "physical-intelligence/libero_videos/eval",
+        # dataset_path / "ericonaldo/bridge_v2_videos/eval",
+        # dataset_path / "ericonaldo/bridge_v2_videos/eval",
     ]
 
-    create_split_jsonl(train_video_dirs, eval_video_dirs, "libero", shared_train_num=1, eval_num=1)
+    create_split_jsonl(train_video_dirs, eval_video_dirs, "debug", shared_train_num=1, eval_num=1)
