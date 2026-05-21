@@ -38,6 +38,7 @@ class Trainer:
 
         self.resume = args.resume
         self.resume_path = args.resume_path
+        self.reset_global_step = getattr(args.train, "reset_global_step", False)
         self.do_train = args.do_train
 
         self.num_iters = args.train.num_iters
@@ -174,7 +175,13 @@ class Trainer:
 
     def load_checkpoint(self, load_path) -> None:
         global_step = self.model._load_ckpt(load_path)
-        self.global_step = global_step
+        if self.reset_global_step:
+            overwatch.warning(
+                f"reset_global_step=True: ignoring checkpoint global_step={global_step}, starting from 0"
+            )
+            self.global_step = 0
+        else:
+            self.global_step = global_step
 
     def _resume_training_state(self) -> None:
         """Load optimizer, scheduler and RNG state. Must be called after ``prepare()``."""

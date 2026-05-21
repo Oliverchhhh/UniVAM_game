@@ -2,7 +2,7 @@ seed: 33
 do_train: True
 log_dir: logs
 resume: True
-resume_path: ckpts/libero/149400
+resume_path: ckpts/libero/64000
 task_name: libero
 
 action:
@@ -51,9 +51,9 @@ train:
   save_step: 1000
   local_batch_size: 32
   eval_sample_num: 4
-  learning_rate: 1e-4     # 3e-5 | 1e-4 for lora
+  learning_rate: 3e-5     # 3e-5 | 1e-4 for lora
   warmup_ratio: 0.01
   decay: 1e-3
   ckpt_save_dir: ckpts
   gradient_accumulate_steps: 1
-  reset_global_step: True  # when resume=True, set True to ignore checkpoint global_step and start from 0
+  reset_global_step: False  # when resume=True, set True to ignore checkpoint global_step and start from 0
