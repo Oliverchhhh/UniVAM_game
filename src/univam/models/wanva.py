@@ -18,14 +18,18 @@ overwatch = initialize_overwatch(__name__)
 
 def sample_timestep_id(
     batch_size,
-    min_timestep_bd: float = 0.0,
-    max_timestep_bd: float = 1.0,
     num_train_timesteps: int = 1000,
     device: torch.device = torch.device("cpu"),
+    alpha: float = 1.5,
+    beta: float = 1.0,
 ):
-    u = torch.rand(size=[batch_size], device=device)
-    u = u * (max_timestep_bd - min_timestep_bd) + min_timestep_bd
-    timestep_id = (u * num_train_timesteps).clamp(min=0, max=num_train_timesteps - 1).to(torch.int64)
+    # Beta(1.5, 1.0) sampling: mean ≈ 0.6, biased toward high-noise region
+    gamma1 = torch.rand((batch_size,), device=device).pow(1 / alpha)
+    gamma2 = torch.rand((batch_size,), device=device).pow(1 / beta)
+    time = gamma1 / (gamma1 + gamma2)
+    # map to (0.001, 1.0) to avoid extreme t=0 or t=1
+    time = time * 0.999 + 0.001
+    timestep_id = (time * num_train_timesteps).clamp(min=0, max=num_train_timesteps - 1).to(torch.int64)
     return timestep_id
 
 

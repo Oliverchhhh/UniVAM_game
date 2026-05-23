@@ -137,11 +137,11 @@ class FlowMatchScheduler:
         return weights
 
     def calculate_loss(self, pred, target, timestep, timestep_id):
-        weights = self.training_weight(timestep, timestep_id)
+        # weights = self.training_weight(timestep, timestep_id)
         # compute loss in fp32 to preserve precision under bf16 mixed precision
         loss = torch.nn.functional.mse_loss(pred.float(), target.float(), reduction="none")
         loss = loss.reshape(loss.shape[0], -1).mean(dim=1)
-        loss = loss * weights
+        # loss = loss * weights
         loss = loss.mean()
         return loss
 
