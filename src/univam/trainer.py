@@ -1,12 +1,13 @@
 import os
 import time
+from datetime import timedelta
 from typing import Any, Dict
 
 import numpy as np
 import torch
 import torch.distributed as DIST
 import torchvision.transforms as T
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm
@@ -76,11 +77,13 @@ class Trainer:
                 self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
 
     def prepare_dist_model(self) -> None:
+        pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
         self.accelerator = Accelerator(
             log_with="tensorboard",
             mixed_precision="bf16",
             project_dir=self.log_dir,
             gradient_accumulation_steps=self.gradient_accumulate_steps,
+            kwargs_handlers=[pg_kwargs],
         )
         self.accelerator.init_trackers("train")
         # self.accelerator.even_batches = False
@@ -151,9 +154,8 @@ class Trainer:
         save_path = os.path.join(self.ckpt_save_dir, str(self.global_step))
         overwatch.warning(f"Saving checkpoint to {save_path}")
 
-        self.accelerator.wait_for_everyone()
         # get_state_dict is a collective operation; all ranks must participate.
-        # With ZeRO-3 it may return None on non-zero ranks.
+        self.accelerator.wait_for_everyone()
         full_state_dict = self.accelerator.get_state_dict(self.model)
         model_dict = {}
         projector_dict = {}
@@ -168,10 +170,10 @@ class Trainer:
             ensure_directory(save_path)
             self.model._save_ckpt(model_dict, projector_dict, save_path, self.global_step)
 
-        # Save optimizer / scheduler / RNG state for full training resume.
-        # accelerate handles both normal and DeepSpeed ZeRO formats internally.
-        # train_state_dir = os.path.join(save_path, "train_state")
-        # self.accelerator.save_state(train_state_dir, safe_serialization=False)
+        # Block all ranks until rank 0 finishes writing. PG-0 timeout is set to
+        # 4 hours in prepare_dist_model so slow network storage won't trigger a
+        # watchdog kill during this barrier.
+        self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self, load_path) -> None:
         global_step = self.model._load_ckpt(load_path)

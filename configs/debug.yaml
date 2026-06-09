@@ -3,7 +3,7 @@ do_train: True
 log_dir: logs
 resume: False
 resume_path: null
-task_name: debug
+task_name: cuphead
 
 action:
   num_layers: 6
@@ -35,20 +35,20 @@ data:
   frames: 5
   num_workers: 16
   image_size: [256, 256]
-  train_json_path: ./jsons/train_debug.json
-  eval_json_path: ./jsons/eval_debug.json
+  train_json_path: ./jsons/train_fractal.json
+  eval_json_path: ./jsons/eval_fractal.json
 
 lora:
-  enable: True
+  enable: False
   r: 16
   lora_alpha: 32
 
 train:
   dist: True
   epochs: 200
-  num_iters: null
-  eval_step: 20
-  save_step: 20
+  num_iters: 200000
+  eval_step: 50000
+  save_step: 50000
   local_batch_size: 8
   eval_sample_num: 4
   learning_rate: 3e-5

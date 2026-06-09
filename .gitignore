@@ -180,6 +180,9 @@ jsons/
 logs/
 ckpts/
 ckpts
+video/
+tests/eval/
+models/
 *_test_*
 
 # special files
@@ -188,3 +191,5 @@ core*
 scripts/train_mutil.sh
 kernel_meta/
 fusion_result.json
+torchcodec-0.7.0+cu129torch2.8.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl
+torchvision-0.23.0+cu129torch2.8.0ubuntu2404ce-cp312-cp312-linux_x86_64.whl

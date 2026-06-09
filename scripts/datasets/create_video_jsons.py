@@ -111,15 +111,11 @@ if __name__ == "__main__":
     dataset_path = Path(os.environ.get("DATASETS_PATH", "./datasets"))
 
     train_video_dirs = [
-        # dataset_path / "physical-intelligence/libero_videos/train",
-        # dataset_path / "ericonaldo/bridge_v2_videos/train",
-        dataset_path / "ucasmichael/fractal_videos/train",
-    ]
-
+    Path("/mnt/workspace/datasets/games/cuphead_supplementary"),
+        ]
     eval_video_dirs = [
-        # dataset_path / "physical-intelligence/libero_videos/eval",
-        # dataset_path / "ericonaldo/bridge_v2_videos/eval",
-        dataset_path / "ucasmichael/fractal_videos/eval",
-    ]
+            Path("/mnt/workspace/datasets/games/cuphead_supplementary"),
+        ]
+
 
     create_split_jsonl(train_video_dirs, eval_video_dirs, "fractal", shared_train_num=1, eval_num=1)
