@@ -39,12 +39,29 @@ class Wan22VisionModel(nn.Module):
 
         # Keep VAE out of nn.Module tree so ZeRO-3 won't partition it.
         # Its internal temporal feature caching is incompatible with parameter sharding.
-        wanvae = WanVAE(
-            config.wanva.model_path,
-            frames=config.data.frames,
-        )
+
+        # 选择使用 Flux+Wan 混合 VAE 或原始 Wan VAE
+        use_flux = getattr(config, "use_flux_encoder", False)
+
+        if use_flux:
+            from univam.models.wan import FluxWanVAE
+            flux_path = getattr(config.flux, "model_path", "black-forest-labs/FLUX.1-schnell")
+            wanvae = FluxWanVAE(
+                flux_model_path=flux_path,
+                wan_model_path=config.wanva.model_path,
+                frames=config.data.frames,
+            )
+            overwatch.info("Using FluxWanVAE (Flux Encoder + Extra Layers + Wan Decoder)")
+            vae_hw = 16  # Wan VAE 的空间压缩比
+        else:
+            wanvae = WanVAE(
+                config.wanva.model_path,
+                frames=config.data.frames,
+            )
+            overwatch.info("Using original WanVAE")
+            vae_hw = wanvae.vae.config.scale_factor_spatial
+
         self.__dict__["wanvae"] = wanvae  # bypass nn.Module.__setattr__
-        vae_hw = self.wanvae.vae.config.scale_factor_spatial
 
         height, width = config.data.image_size
         latent_t_num = self.wanvae.latent_t_num
@@ -170,6 +187,13 @@ class Wan22VisionModel(nn.Module):
 
         self.projector.train()
         self.projector.requires_grad_(True)
+
+        # FluxWanVAE 的额外层需要训练
+        if hasattr(self.wanvae, 'extra_encoder_layers'):
+            self.wanvae.extra_encoder_layers.train()
+            self.wanvae.extra_encoder_layers.requires_grad_(True)
+            trainable_params = sum(p.numel() for p in self.wanvae.extra_encoder_layers.parameters() if p.requires_grad)
+            overwatch.info(f"FluxWanVAE extra_encoder_layers set to trainable ({trainable_params:,} params)")
 
         self.wanvae.eval()
         self.wanvae.requires_grad_(False)

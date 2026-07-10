@@ -1,0 +1,43 @@
+use_flux_encoder: True
+
+flux:
+  model_path: "black-forest-labs/FLUX.1-schnell"  # 或本地路径
+
+wanva:
+  model_path: "/path/to/Wan2.2-TI2V-5B-Diffusers"  # 修改为你的实际路径
+  patch_size: [1, 2, 2]
+  num_attention_heads: 24
+  guidance_scale: 1.0
+  num_inference_steps: 20
+
+projector:
+  type: "qformer"
+  num_token: 2
+  hidden_dim: 4096
+  output_align_dim: 4096
+  patch_size: [1, 2, 2]
+
+lora:
+  enable: True
+  r: 16
+  lora_alpha: 32
+
+data:
+  type: "video"
+  frames: 5
+  fps: 2
+  image_size: [256, 256]
+  train_json_path: "./jsons/train_fractal.json"
+  eval_json_path: "./jsons/eval_fractal.json"
+
+train:
+  local_batch_size: 1
+  learning_rate: 3e-5
+  warmup_ratio: 0.01
+  decay: 1e-3
+  max_steps: 10000
+  eval_step: 500
+  save_step: 1000
+  eval_sample_num: 10
+
+seed: 33

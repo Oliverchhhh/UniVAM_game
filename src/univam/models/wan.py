@@ -448,3 +448,185 @@ if __name__ == "__main__":
 
     video_latents = test_wanvae(args, videos, device, dtype)
     test_transformer3d(args, video_latents, device, dtype)
+
+
+class FluxWanVAE(nn.Module):
+    """
+    混合 VAE：Flux Encoder + 额外映射层 + Wan Decoder
+    导师方案："用 flux 试试吧，enc 在 vae enc 后面再套几层"
+    """
+    def __init__(self, flux_model_path: str = None, wan_model_path: str = None, frames: int = 4):
+        super().__init__()
+
+        # 默认使用 FLUX.1-schnell
+        if flux_model_path is None:
+            flux_model_path = "black-forest-labs/FLUX.1-schnell"
+
+        overwatch.info(f"Loading Flux VAE encoder from: {flux_model_path}")
+
+        # 1. 加载 Flux VAE (只用 encoder)
+        from diffusers import AutoencoderKL
+        try:
+            flux_vae = AutoencoderKL.from_pretrained(
+                flux_model_path,
+                subfolder="vae",
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+            self.flux_encoder = flux_vae.encoder
+        except Exception as e:
+            overwatch.warning(f"Failed to load from subfolder 'vae', trying root: {e}")
+            flux_vae = AutoencoderKL.from_pretrained(
+                flux_model_path,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+            self.flux_encoder = flux_vae.encoder
+
+        self.flux_encoder.requires_grad_(False)
+        self.flux_encoder.eval()
+        overwatch.info("Flux encoder loaded and frozen")
+
+        # 2. 加载 Wan VAE (只用 decoder)
+        overwatch.info(f"Loading Wan VAE decoder from: {wan_model_path}")
+        wan_vae = AutoencoderKLWan.from_pretrained(wan_model_path, subfolder="vae")
+        self.wan_decoder = wan_vae
+        self.wan_decoder.requires_grad_(False)
+        self.wan_decoder.eval()
+        overwatch.info("Wan decoder loaded and frozen")
+
+        # Wan VAE 的标准化参数
+        self.register_buffer("latent_mean", torch.tensor(wan_vae.config.latents_mean).view(1, -1, 1, 1, 1))
+        self.register_buffer("latent_std", torch.tensor(wan_vae.config.latents_std).view(1, -1, 1, 1, 1))
+
+        # 3. "套几层" - 额外的 encoder 层（可训练）
+        # Flux: [B, 16, T, 32, 32] (假设256x256输入 → 32x32, 8x压缩)
+        # → Wan: [B, 48, T', 16, 16] (16x压缩, 4x时间压缩)
+        self.extra_encoder_layers = nn.Sequential(
+            # 第1层：空间下采样 2x + 通道扩展
+            nn.Conv3d(16, 32, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+
+            # 第2层：通道扩展到 48
+            nn.Conv3d(32, 48, kernel_size=(3, 3, 3), stride=(1, 1, 1), padding=1),
+            nn.GroupNorm(8, 48),
+            nn.SiLU(),
+
+            # 第3层：时间压缩 4x（匹配 Wan 的时间压缩）
+            nn.Conv3d(48, 48, kernel_size=(4, 1, 1), stride=(4, 1, 1), padding=0),
+            nn.GroupNorm(8, 48),
+            nn.SiLU(),
+        )
+        overwatch.info("Extra encoder layers initialized (trainable)")
+
+        # 视频对齐参数（与原 WanVAE 一致）
+        self.frames = frames
+        self.pad_chunk_size = 4
+        self.pad_num = self.get_pad_num()
+        self.latent_t_num = self.get_latent_t_num()
+
+    def get_pad_num(self):
+        remainder = (self.frames - 1) % self.pad_chunk_size
+        if remainder != 0:
+            return self.pad_chunk_size - remainder
+        else:
+            return 0
+
+    def get_latent_t_num(self):
+        T_pad = self.frames + self.pad_num
+        return (T_pad - 1) // 4 + 1
+
+    def align_video(self, videos: torch.Tensor):
+        """videos: [B, T, C, H, W]"""
+        if self.pad_num != 0:
+            last_frame = videos[:, -1:, :, :, :]
+            pad_frames = last_frame.repeat(1, self.pad_num, 1, 1, 1)
+            videos = torch.cat([videos, pad_frames], dim=1)
+        return videos
+
+    def inverse_align_video(self, videos: torch.Tensor):
+        """videos: [B, T, C, H, W]"""
+        if self.pad_num != 0:
+            videos = videos[:, : -self.pad_num, :, :, :]
+        return videos
+
+    def encode(self, videos: torch.Tensor):
+        """
+        Args:
+            videos: [B, T, C, H, W]
+        Returns:
+            video_latents: [B, 48, T', H/16, W/16]
+        """
+        videos = self.align_video(videos)
+        B, T, C, H, W = videos.shape
+
+        # Step 1: Flux encoder 逐帧编码（冻结）
+        flux_latents = []
+        with torch.no_grad():
+            for t in range(T):
+                frame = videos[:, t]  # [B, C, H, W]
+                # Flux encoder: [B, C, H, W] → [B, 16, H/8, W/8]
+                latent_t = self.flux_encoder(frame)
+                flux_latents.append(latent_t)
+
+        flux_latents = torch.stack(flux_latents, dim=2)  # [B, 16, T, H/8, W/8]
+
+        # Step 2: 额外的 encoder 层（可训练）
+        wan_latents = self.extra_encoder_layers(flux_latents)  # [B, 48, T', H/16, W/16]
+
+        # Step 3: 标准化（使用 Wan VAE 的参数）
+        mean = self.latent_mean.to(wan_latents.dtype)
+        std = self.latent_std.to(wan_latents.dtype)
+        wan_latents = (wan_latents - mean) / std
+
+        return wan_latents
+
+    @torch.no_grad()
+    def decode(self, video_latents: torch.Tensor):
+        """
+        Args:
+            video_latents: [B, 48, T', H/16, W/16]
+        Returns:
+            videos: [B, T, C, H, W]
+        """
+        # 反标准化
+        mean = self.latent_mean.to(video_latents.dtype)
+        std = self.latent_std.to(video_latents.dtype)
+        video_latents = video_latents * std + mean
+
+        # 使用 Wan decoder
+        videos = self.wan_decoder.decode(video_latents, return_dict=False)[0]
+
+        # [B, C, T, H, W] → [B, T, C, H, W]
+        videos = videos.permute(0, 2, 1, 3, 4)
+        videos = self.inverse_align_video(videos)
+
+        return videos
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.flux_encoder.to(*args, **kwargs)
+        self.wan_decoder.to(*args, **kwargs)
+        return self
+
+    def eval(self):
+        super().eval()
+        self.flux_encoder.eval()
+        self.wan_decoder.eval()
+        # extra_encoder_layers 在训练时会被单独设置
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        # 保持 encoder/decoder 冻结
+        self.flux_encoder.eval()
+        self.wan_decoder.eval()
+        return self
+
+    def requires_grad_(self, requires_grad: bool):
+        # 只有 extra_encoder_layers 可训练
+        self.extra_encoder_layers.requires_grad_(requires_grad)
+        self.flux_encoder.requires_grad_(False)
+        self.wan_decoder.requires_grad_(False)
+        return self
