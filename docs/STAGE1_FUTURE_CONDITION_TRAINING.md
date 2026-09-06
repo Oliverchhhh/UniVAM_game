@@ -33,6 +33,7 @@ export HTTP_PROXY=http://127.0.0.1:10090
 export HTTPS_PROXY=$HTTP_PROXY
 
 bash scripts/setup_stage1_conda.sh
+source /root/miniconda3/etc/profile.d/conda.sh
 conda activate nitrogen-stage1
 hf auth login                         # 私有数据集需要
 bash scripts/prepare_cuphead_action_assets.sh
