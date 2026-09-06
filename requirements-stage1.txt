@@ -1,0 +1,16 @@
+# Install a CUDA build of torch/torchvision first; do not let pip replace it.
+accelerate>=1.6,<2
+diffusers>=0.32,<0.36
+einops==0.8.0
+huggingface-hub>=0.30,<1
+numpy>=1.26,<3
+pillow>=10
+polars>=1.20,<2
+protobuf>=5.29
+pydantic>=2.10,<3
+pyyaml>=6
+timm==0.9.10
+# torchcodec 0.6/0.7 are the releases compatible with torch 2.8.
+torchcodec==0.7.0
+torchdiffeq>=0.2.5
+transformers==4.51.3

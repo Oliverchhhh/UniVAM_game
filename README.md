@@ -1,5 +1,9 @@
 # UniVAM
 
+> Cuphead 的 NitroGen + WoG 第一阶段未来动作表征训练位于 `wog` 分支，双 RTX
+> 5090D 的部署、监控和评估命令见
+> [`docs/STAGE1_FUTURE_CONDITION_TRAINING.md`](docs/STAGE1_FUTURE_CONDITION_TRAINING.md)。
+
 基于扩散模型的机器人视频预测模型。给定一段机器人操作的短视频（如机械臂抓取物体的前几帧），模型能够预测后续的未来帧画面，用于辅助机器人操作与规划任务。
 
 ## 技术架构

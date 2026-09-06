@@ -1,0 +1,41 @@
+seed: 43
+output_dir: ${STAGE1_OUTPUT_DIR}
+
+data:
+  root: ${CUPHEAD_ACTION_DATA_ROOT}
+  video_name: 256x256.mp4
+  # One training anchor per 4 source frames; validation is deliberately sparse.
+  train_stride: 4
+  val_stride: 17
+  workers: 2
+  prefetch_factor: 2
+
+model:
+  nitrogen_checkpoint: ${STAGE1_NITROGEN_CKPT}
+  nitrogen_root: ${STAGE1_NITROGEN_ROOT}
+  siglip_path: ${STAGE1_SIGLIP_PATH}
+  wog_root: ${STAGE1_WOG_ROOT}
+  dtype: bfloat16
+  condition_dim: 64
+  qformer_hidden: 1024
+  qformer_layers: 6
+  adapter_dim: 256
+  condition_dropout: 0.10
+  gradient_checkpointing: true
+
+train:
+  # Two 32-GiB RTX 5090D cards. The dry-run must pass before formal training.
+  micro_batch_size: 2
+  gradient_accumulation: 4
+  max_steps: 50000
+  learning_rate: 0.0001
+  min_lr_ratio: 0.10
+  warmup_steps: 1000
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  grad_clip: 1.0
+  log_every: 20
+  val_every: 1000
+  val_batches: 64
+  save_every: 1000
+  archive_every: 5000

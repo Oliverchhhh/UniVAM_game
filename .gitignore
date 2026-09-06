@@ -183,6 +183,10 @@ ckpts
 video/
 tests/eval/
 models/
+third_party/WoG/pretrained/
+stage1-runs/
+cuphead-action-assets/
+cuphead-action-data/
 *_test_*
 
 # special files
