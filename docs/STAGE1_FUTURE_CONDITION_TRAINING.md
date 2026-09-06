@@ -31,15 +31,17 @@ cd /root/autodl-tmp/cuphead-stage1
 git clone -b wog https://github.com/Oliverchhhh/UniVAM_game.git
 cd UniVAM_game
 
-# 可选：本地代理
-export HTTP_PROXY=http://127.0.0.1:10090
-export HTTPS_PROXY=$HTTP_PROXY
+# 本地反向代理；每次打开新终端都要重新设置
+export PROXY_PORT=10090
+export STAGE1_STORAGE_ROOT=/root/autodl-tmp/cuphead-stage1
+source scripts/stage1_storage_env.sh
+curl -I --max-time 30 https://huggingface.co
 
 bash scripts/setup_stage1_conda.sh
 source /root/miniconda3/etc/profile.d/conda.sh
 conda activate /root/autodl-tmp/cuphead-stage1/conda-env
 hf auth login                         # 私有数据集需要
-bash scripts/prepare_cuphead_action_assets.sh
+PROXY_PORT=10090 bash scripts/prepare_cuphead_action_assets.sh
 ```
 
 上述脚本会把 Conda 环境、Conda/pip/Hugging Face/torch 缓存、模型、数据、日志、

@@ -9,6 +9,12 @@ DELETE_DATA_SHARDS_AFTER_EXTRACT="${DELETE_DATA_SHARDS_AFTER_EXTRACT:-1}"
 READY_MARKER="${ASSET_ROOT}/.stage1_assets_ready"
 
 mkdir -p "${ASSET_ROOT}" "${CUPHEAD_ACTION_DATA_ROOT}"
+if command -v curl >/dev/null 2>&1 && \
+   ! curl -fsSIL --connect-timeout 10 --max-time 30 https://huggingface.co/ >/dev/null; then
+  echo "Cannot reach Hugging Face. If using the reverse proxy, verify the tunnel and run:" >&2
+  echo "  PROXY_PORT=10090 bash scripts/prepare_cuphead_action_assets.sh" >&2
+  exit 1
+fi
 chunk_count="$(find "${CUPHEAD_ACTION_DATA_ROOT}" -name annotation.proto | wc -l)"
 assets_complete=1
 for required_asset in \

@@ -36,6 +36,17 @@ export STAGE1_OUTPUT_DIR LOG_ROOT CONDA_ENV_PREFIX
 export HF_HOME HF_HUB_CACHE HF_XET_CACHE CONDA_PKGS_DIRS
 export XDG_CACHE_HOME TORCH_HOME PIP_CACHE_DIR TMPDIR
 
+# Setting PROXY_PORT is enough for Python requests, Hugging Face, git and curl.
+# This is intentionally repeated whenever the file is sourced because exports
+# from an earlier terminal do not survive opening a new terminal.
+if [[ -n "${PROXY_PORT:-}" ]]; then
+  HTTP_PROXY="http://127.0.0.1:${PROXY_PORT}"
+  HTTPS_PROXY="${HTTP_PROXY}"
+  http_proxy="${HTTP_PROXY}"
+  https_proxy="${HTTPS_PROXY}"
+  export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+fi
+
 mkdir -p \
   "${ASSET_ROOT}" "${CUPHEAD_ACTION_DATA_ROOT}" "${LOG_ROOT}" \
   "${HF_HUB_CACHE}" "${HF_XET_CACHE}" "${CONDA_PKGS_DIRS}" \
