@@ -25,7 +25,10 @@ V-JEPA2 特征没有被上传，因为本阶段不读取它们。
 ## 双 RTX 5090D 快速部署
 
 ```bash
-git clone -b wog git@github.com:Oliverchhhh/UniVAM_game.git
+df -h / /root/autodl-tmp               # 两行必须对应不同文件系统
+mkdir -p /root/autodl-tmp/cuphead-stage1
+cd /root/autodl-tmp/cuphead-stage1
+git clone -b wog https://github.com/Oliverchhhh/UniVAM_game.git
 cd UniVAM_game
 
 # 可选：本地代理
@@ -34,10 +37,15 @@ export HTTPS_PROXY=$HTTP_PROXY
 
 bash scripts/setup_stage1_conda.sh
 source /root/miniconda3/etc/profile.d/conda.sh
-conda activate nitrogen-stage1
+conda activate /root/autodl-tmp/cuphead-stage1/conda-env
 hf auth login                         # 私有数据集需要
 bash scripts/prepare_cuphead_action_assets.sh
 ```
+
+上述脚本会把 Conda 环境、Conda/pip/Hugging Face/torch 缓存、模型、数据、日志、
+checkpoint 和临时文件全部放在 `/root/autodl-tmp/cuphead-stage1`。数据归档在完成
+SHA256 校验并成功解压 4793 个 chunk 后会自动删除，节省约 9.3 GiB；原文件仍可从
+Hugging Face 恢复。系统盘只安装 FFmpeg 的小型系统动态库。
 
 先运行双卡真实 forward/backward：
 
@@ -50,7 +58,8 @@ dry-run 通过后，在 tmux 中启动带保卡、卡死检测和 checkpoint 自
 ```bash
 tmux new -d -s cuphead-stage1 \
   "bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh; \
-  conda activate nitrogen-stage1; cd /root/UniVAM_game; \
+  conda activate /root/autodl-tmp/cuphead-stage1/conda-env; \
+  cd /root/autodl-tmp/cuphead-stage1/UniVAM_game; \
   PROXY_PORT=10090 PHYSICAL_GPUS=0,1 \
   bash scripts/supervise_stage1_2x5090d.sh'"
 
@@ -59,13 +68,13 @@ tmux attach -t cuphead-stage1
 
 若 Miniconda 不在 `/root/miniconda3`，只需把 tmux 命令里的 activation 路径改成
 服务器上的实际位置。正式训练默认输出到
-`/root/stage1-runs/stage1_future_condition_2x5090d`。
+`/root/autodl-tmp/cuphead-stage1/runs/stage1_future_condition_2x5090d`。
 
 ## 监控与恢复
 
 ```bash
-tail -f /root/stage1-runs/stage1_training_supervised.log
-tail -f /root/stage1-runs/stage1_supervisor.log
+tail -f /root/autodl-tmp/cuphead-stage1/runs/stage1_training_supervised.log
+tail -f /root/autodl-tmp/cuphead-stage1/runs/stage1_supervisor.log
 nvidia-smi
 ```
 
@@ -78,9 +87,9 @@ nvidia-smi
 ```bash
 python -m stage1_future_condition.evaluate \
   --config configs/stage1_future_condition_2x5090d.yaml \
-  --checkpoint /root/stage1-runs/stage1_future_condition_2x5090d/final.pt \
+  --checkpoint /root/autodl-tmp/cuphead-stage1/runs/stage1_future_condition_2x5090d/final.pt \
   --batches 256 \
-  --output /root/stage1-runs/stage1_future_condition_2x5090d/eval.json
+  --output /root/autodl-tmp/cuphead-stage1/runs/stage1_future_condition_2x5090d/eval.json
 ```
 
 正确未来条件的 loss 应稳定低于 shuffled 和 zero condition。只有满足这一点，才说明

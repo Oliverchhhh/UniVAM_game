@@ -38,4 +38,6 @@ train:
   val_every: 1000
   val_batches: 64
   save_every: 1000
-  archive_every: 5000
+  # Keep five historical checkpoints; 50-GiB AutoDL data disks do not have
+  # enough headroom for an archive every 5k steps plus latest/final copies.
+  archive_every: 10000

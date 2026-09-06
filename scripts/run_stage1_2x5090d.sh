@@ -2,12 +2,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${REPO_ROOT}/scripts/stage1_storage_env.sh"
 cd "${REPO_ROOT}"
 
 CONFIG="${CONFIG:-configs/stage1_future_condition_2x5090d.yaml}"
-ASSET_ROOT="${ASSET_ROOT:-/root/cuphead-action-assets}"
-CUPHEAD_ACTION_DATA_ROOT="${CUPHEAD_ACTION_DATA_ROOT:-/root/cuphead-action-data}"
-STAGE1_OUTPUT_DIR="${STAGE1_OUTPUT_DIR:-/root/stage1-runs/stage1_future_condition_2x5090d}"
 STAGE1_NITROGEN_CKPT="${STAGE1_NITROGEN_CKPT:-${ASSET_ROOT}/checkpoints/nitrogen/ng.pt}"
 STAGE1_NITROGEN_ROOT="${STAGE1_NITROGEN_ROOT:-${REPO_ROOT}/third_party/NitroGen-real-time}"
 STAGE1_SIGLIP_PATH="${STAGE1_SIGLIP_PATH:-${ASSET_ROOT}/checkpoints/siglip2-large-patch16-256}"

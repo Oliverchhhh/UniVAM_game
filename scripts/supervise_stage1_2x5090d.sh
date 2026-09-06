@@ -3,8 +3,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${REPO_ROOT}/scripts/stage1_storage_env.sh"
 PHYSICAL_GPUS="${PHYSICAL_GPUS:-0,1}"
-LOG_ROOT="${LOG_ROOT:-/root/stage1-runs}"
 RUN_DIR="${RUN_DIR:-${STAGE1_OUTPUT_DIR:-${LOG_ROOT}/stage1_future_condition_2x5090d}}"
 TRAIN_LOG="${TRAIN_LOG:-${LOG_ROOT}/stage1_training_supervised.log}"
 SUPERVISOR_LOG="${SUPERVISOR_LOG:-${LOG_ROOT}/stage1_supervisor.log}"
@@ -18,7 +18,7 @@ mkdir -p "${LOG_ROOT}"
 cd "${REPO_ROOT}"
 
 if ! python -c 'import torch' >/dev/null 2>&1; then
-  echo "The Stage-I environment is not active. Run: conda activate nitrogen-stage1" >&2
+  echo "The Stage-I environment is not active. Run: conda activate ${CONDA_ENV_PREFIX}" >&2
   exit 1
 fi
 

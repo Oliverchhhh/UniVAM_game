@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${REPO_ROOT}/scripts/stage1_storage_env.sh"
 if [[ -z "${CONDA_EXE:-}" ]]; then
   if command -v conda >/dev/null 2>&1; then
     CONDA_EXE="$(command -v conda)"
@@ -14,18 +15,18 @@ if [[ -z "${CONDA_EXE:-}" ]]; then
     exit 1
   fi
 fi
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-nitrogen-stage1}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.org/simple}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 CONDA_CHANNEL="${CONDA_CHANNEL:-https://repo.anaconda.com/pkgs/main}"
+export PIP_NO_CACHE_DIR="${PIP_NO_CACHE_DIR:-1}"
 
 eval "$("${CONDA_EXE}" shell.bash hook)"
-if ! conda env list | awk '{print $1}' | grep -qx "${CONDA_ENV_NAME}"; then
+if [[ ! -f "${CONDA_ENV_PREFIX}/conda-meta/history" ]]; then
   # Do not inherit potentially stale global mirrors (the old TUNA conda-forge
   # endpoint currently returns HTTP 403 on this host).
-  conda create -y -n "${CONDA_ENV_NAME}" --override-channels -c "${CONDA_CHANNEL}" python=3.12 pip
+  conda create -y -p "${CONDA_ENV_PREFIX}" --override-channels -c "${CONDA_CHANNEL}" python=3.12 pip
 fi
-conda activate "${CONDA_ENV_NAME}"
+conda activate "${CONDA_ENV_PREFIX}"
 
 python -m pip install --upgrade pip wheel setuptools -i "${PIP_INDEX_URL}"
 python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url "${TORCH_INDEX_URL}"
@@ -59,7 +60,11 @@ print("transformers", transformers.__version__)
 print("cuda_available", torch.cuda.is_available())
 PY
 
+# The environment is self-contained; downloaded conda packages are no longer
+# needed and otherwise consume data-disk space.
+conda clean -a -y
+
 CONDA_BASE="$("${CONDA_EXE}" info --base)"
 echo "Conda environment is ready. In every new terminal run:"
 echo "  source ${CONDA_BASE}/etc/profile.d/conda.sh"
-echo "  conda activate ${CONDA_ENV_NAME}"
+echo "  conda activate ${CONDA_ENV_PREFIX}"
