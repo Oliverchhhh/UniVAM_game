@@ -1,0 +1,7 @@
+# Keep executable and configuration files usable when the repository is
+# checked out or repackaged on Windows before being copied to Linux.
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
