@@ -25,6 +25,11 @@ CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-${STAGE1_STORAGE_ROOT}/conda-env}"
 HF_HOME="${HF_HOME:-${STAGE1_STORAGE_ROOT}/cache/huggingface}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}"
+# hf-xet can consume substantial host RAM while reconstructing multi-GiB
+# checkpoints. The regular HTTP downloader supports resume and is safer on
+# low-memory CPU instances used only for asset preparation.
+HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-3600}"
 CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-${STAGE1_STORAGE_ROOT}/cache/conda-pkgs}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-${STAGE1_STORAGE_ROOT}/cache/xdg}"
 TORCH_HOME="${TORCH_HOME:-${STAGE1_STORAGE_ROOT}/cache/torch}"
@@ -33,7 +38,8 @@ TMPDIR="${TMPDIR:-${STAGE1_STORAGE_ROOT}/tmp}"
 
 export STAGE1_STORAGE_ROOT ASSET_ROOT CUPHEAD_ACTION_DATA_ROOT
 export STAGE1_OUTPUT_DIR LOG_ROOT CONDA_ENV_PREFIX
-export HF_HOME HF_HUB_CACHE HF_XET_CACHE CONDA_PKGS_DIRS
+export HF_HOME HF_HUB_CACHE HF_XET_CACHE HF_HUB_DISABLE_XET HF_HUB_DOWNLOAD_TIMEOUT
+export CONDA_PKGS_DIRS
 export XDG_CACHE_HOME TORCH_HOME PIP_CACHE_DIR TMPDIR
 
 # Setting PROXY_PORT is enough for Python requests, Hugging Face, git and curl.

@@ -47,7 +47,8 @@ PROXY_PORT=10090 bash scripts/prepare_cuphead_action_assets.sh
 上述脚本会把 Conda 环境、Conda/pip/Hugging Face/torch 缓存、模型、数据、日志、
 checkpoint 和临时文件全部放在 `/root/autodl-tmp/cuphead-stage1`。数据归档在完成
 SHA256 校验并成功解压 4793 个 chunk 后会自动删除，节省约 9.3 GiB；原文件仍可从
-Hugging Face 恢复。系统盘只安装 FFmpeg 的小型系统动态库。
+Hugging Face 恢复。下载默认禁用高内存的 hf-xet 重建路径，使用支持断点续传的普通
+HTTP。系统盘只安装 FFmpeg 的小型系统动态库。
 
 先运行双卡真实 forward/backward：
 
