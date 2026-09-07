@@ -6,6 +6,7 @@ source "${REPO_ROOT}/scripts/stage1_storage_env.sh"
 HF_REPO="${HF_REPO:-ch1415926/cuphead-action}"
 EXPECTED_CHUNKS="${EXPECTED_CHUNKS:-4793}"
 DELETE_DATA_SHARDS_AFTER_EXTRACT="${DELETE_DATA_SHARDS_AFTER_EXTRACT:-1}"
+HF_DOWNLOAD_RETRIES="${HF_DOWNLOAD_RETRIES:-30}"
 READY_MARKER="${ASSET_ROOT}/.stage1_assets_ready"
 
 mkdir -p "${ASSET_ROOT}" "${CUPHEAD_ACTION_DATA_ROOT}"
@@ -38,8 +39,24 @@ if [[ ! -f "${READY_MARKER}" || "${chunk_count}" -ne "${EXPECTED_CHUNKS}" || "${
     local local_path="${ASSET_ROOT}/${relative_path}"
     if [[ ! -f "${local_path}" ]] || \
        ! (cd "${ASSET_ROOT}" && echo "${expected_sha}  ${relative_path}" | sha256sum -c - >/dev/null 2>&1); then
-      hf download "${HF_REPO}" "${relative_path}" \
-        --repo-type dataset --local-dir "${ASSET_ROOT}"
+      local attempt delay
+      for ((attempt = 1; attempt <= HF_DOWNLOAD_RETRIES; attempt++)); do
+        if hf download "${HF_REPO}" "${relative_path}" \
+          --repo-type dataset --local-dir "${ASSET_ROOT}"; then
+          break
+        fi
+        if (( attempt == HF_DOWNLOAD_RETRIES )); then
+          echo "Download failed after ${HF_DOWNLOAD_RETRIES} attempts: ${relative_path}" >&2
+          return 1
+        fi
+        delay=$((attempt * 5))
+        if (( delay > 60 )); then
+          delay=60
+        fi
+        echo "Download interrupted; retrying ${relative_path} in ${delay}s " \
+             "(${attempt}/${HF_DOWNLOAD_RETRIES}). Partial bytes are preserved." >&2
+        sleep "${delay}"
+      done
     fi
     (cd "${ASSET_ROOT}" && echo "${expected_sha}  ${relative_path}" | sha256sum -c -)
   }
